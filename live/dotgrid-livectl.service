@@ -1,0 +1,15 @@
+# DotGrid # managed by install.sh --live
+[Unit]
+Description=DotGrid Live wallpaper control (state, autopause, tray, shortcut)
+PartOf=graphical-session.target
+After=graphical-session.target plasma-plasmashell.service
+
+[Service]
+ExecStart=%h/.local/bin/dotgrid-livectl
+Restart=on-failure
+RestartSec=3
+# Plasma exports WAYLAND_DISPLAY / DBUS_SESSION_BUS_ADDRESS to the user manager
+Slice=app.slice
+
+[Install]
+WantedBy=graphical-session.target

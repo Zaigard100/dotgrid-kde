@@ -1,0 +1,14 @@
+{
+    "KPackageStructure": "KSysguard/SensorFace",
+    "KPlugin": {
+        "Authors": [{ "Name": "DotGrid" }],
+        "Description": "Sensors as a dot matrix in the text colour of the theme",
+        "Icon": "office-chart-bar",
+        "Id": "org.dotgrid.dotmatrix",
+        "License": "MIT",
+        "Name": "DotGrid dots",
+        "Name[ru]": "DotGrid точки",
+        "Version": "1.0"
+    },
+    "X-KDE-ParentApp": "org.kde.plasmashell"
+}

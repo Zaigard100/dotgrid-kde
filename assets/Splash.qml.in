@@ -1,0 +1,78 @@
+import QtQuick 2.15
+
+// DotGrid splash. Day or night follows the theme: dotgrid-theme rewrites
+// Mode.qml next to this file on every switch (before the first switch the
+// clock decides, with the hours from ~/.config/dotgrid/schedule). The picture
+// is the static DotGrid composition; 12 tiles fill up with the loading stages.
+Rectangle {
+    id: root
+    property int stage: 0                      // set by ksplash, 1..6
+
+    Mode { id: mode }
+    readonly property int hour: new Date().getHours()
+    readonly property bool night: mode.known ? mode.night : (hour < @DAY_AT@ || hour >= @NIGHT_AT@)
+    readonly property color bg: night ? "#0a0a0a" : "#d6cdbc"
+    readonly property color fg: night ? "#e8e0d0" : "#161614"
+    readonly property color dim: night ? "#2e2d2a" : "#a89f8c"
+    readonly property string mono: "JetBrains Mono"
+    readonly property real u: Math.max(0.5, height / 1600)
+
+    color: bg
+
+    Image {
+        anchors.fill: parent
+        source: root.night ? "images/night.png" : "images/day.png"
+        fillMode: Image.PreserveAspectCrop
+        smooth: true
+    }
+
+    Rectangle {
+        anchors.centerIn: parent
+        width: 760 * root.u
+        height: column.height + 96 * root.u
+        color: root.bg
+        border.color: root.fg
+        border.width: Math.max(2, 3 * root.u)
+
+        Column {
+            id: column
+            anchors.centerIn: parent
+            spacing: 26 * root.u
+
+            Text {
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: "ENVIRON CTR | DR-5 |"
+                color: root.fg
+                font.family: root.mono; font.bold: true
+                font.pixelSize: 34 * root.u; font.letterSpacing: 6 * root.u
+            }
+
+            Text {
+                id: clock
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: Qt.formatTime(new Date(), "HH:mm")
+                color: root.fg
+                font.family: root.mono; font.bold: true
+                font.pixelSize: 150 * root.u; font.letterSpacing: 8 * root.u
+                Timer {
+                    interval: 1000; running: true; repeat: true
+                    onTriggered: clock.text = Qt.formatTime(new Date(), "HH:mm")
+                }
+            }
+
+            // 12 tiles, like the day progress bar
+            Row {
+                anchors.horizontalCenter: parent.horizontalCenter
+                spacing: 8 * root.u
+                Repeater {
+                    model: 12
+                    Rectangle {
+                        required property int index
+                        width: 32 * root.u; height: 32 * root.u
+                        color: index < Math.ceil(root.stage * 12 / 6) ? root.fg : root.dim
+                    }
+                }
+            }
+        }
+    }
+}

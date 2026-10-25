@@ -1,0 +1,45 @@
+# DotGrid Live wallpaper for KDE Plasma 6, system-wide package.
+# Build from this directory of the dotgrid-kde tree:  makepkg -si
+# The colour schemes, Konsole/kitty profiles and dotgrid-theme stay per-user
+# (./install.sh); this package only provides the live wallpaper parts.
+pkgname=dotgrid-live
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Living DotGrid wallpaper for KDE Plasma 6: galaxy, Game of Life, clocks, audio bars, tray control"
+arch=('x86_64')
+license=('GPL-2.0-or-later')
+depends=('plasma-workspace' 'qt6-base' 'qt6-declarative' 'pyside6' 'python-dbus' 'ttf-jetbrains-mono')
+optdepends=('python-numpy: night bars follow the audio spectrum'
+            'pipewire: audio capture (pw-record)'
+            'libpulse: notices when something plays (pactl)')
+makedepends=('cmake' 'ninja')
+install=dotgrid-live.install
+source=()
+
+_tree="$startdir/.."
+
+build() {
+  cmake -S "$_tree/backend" -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+  cmake --build build
+}
+
+package() {
+  local wp="$pkgdir/usr/share/plasma/wallpapers/org.dotgrid.live"
+  install -d "$wp"
+  cp -r "$_tree/plugin/org.dotgrid.live/." "$wp/"
+  rm -rf "$wp/contents/backend"
+  install -Dm644 -t "$wp/contents/backend" \
+    build/qml/org/dotgrid/live/backend/qmldir \
+    build/qml/org/dotgrid/live/backend/dotgridlivebackend.qmltypes
+  install -Dm755 -t "$wp/contents/backend" build/qml/org/dotgrid/live/backend/libdotgridlivebackend.so
+
+  install -Dm755 "$_tree/live/dotgrid-livectl" "$pkgdir/usr/bin/dotgrid-livectl"
+  install -Dm755 "$_tree/live/dotgrid-live" "$pkgdir/usr/bin/dotgrid-live"
+  install -d "$pkgdir/usr/lib/systemd/user"
+  sed 's|^ExecStart=.*|ExecStart=/usr/bin/dotgrid-livectl|; /^# DotGrid # managed/d' \
+    "$_tree/live/dotgrid-livectl.service" > "$pkgdir/usr/lib/systemd/user/dotgrid-livectl.service"
+
+  install -Dm644 "$_tree/assets/day.png" "$pkgdir/usr/share/dotgrid-live/day.png"
+  install -Dm644 "$_tree/assets/night.png" "$pkgdir/usr/share/dotgrid-live/night.png"
+  install -Dm644 "$_tree/README.md" "$pkgdir/usr/share/doc/dotgrid-live/README.md"
+}

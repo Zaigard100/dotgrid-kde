@@ -1,0 +1,20 @@
+/* DotGrid for Zen Browser (and Firefox): empty and new tabs on the dot grid.
+   Imported from chrome/userContent.css by ./install-browser.sh. */
+
+@-moz-document url("about:newtab"), url("about:home"), url("about:privatebrowsing") {
+  :root {
+    --dg-bg: #d6cdbc;
+    --dg-grid: #bdb3a0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --dg-bg: #141413;
+      --dg-grid: #2a2926;
+    }
+  }
+  body {
+    background:
+      radial-gradient(circle at center, var(--dg-grid) 1.1px, transparent 1.6px) 0 0 / 16px 16px,
+      var(--dg-bg) !important;
+  }
+}

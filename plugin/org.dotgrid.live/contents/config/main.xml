@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kcfg xmlns="http://www.kde.org/standards/kcfg/1.0"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.kde.org/standards/kcfg/1.0
+      http://www.kde.org/standards/kcfg/1.0/kcfg.xsd" >
+  <kcfgfile name=""/>
+
+  <group name="General">
+    <entry name="Mode" type="String">
+      <label>auto | day | night. auto follows the KDE colour scheme set by dotgrid-theme</label>
+      <default>auto</default>
+    </entry>
+    <entry name="Fps" type="Int">
+      <label>Animation frame rate (15/24/30/60); every frame redraws the screen, 15 is the frugal default</label>
+      <default>15</default>
+    </entry>
+    <entry name="GalaxyTurnMinutes" type="Double">
+      <label>Galaxy speed: minutes per turn of the outer edge (the core turns faster)</label>
+      <default>4</default>
+    </entry>
+    <entry name="LifeRate" type="Double">
+      <label>Game of Life speed: generations per second</label>
+      <default>2.5</default>
+    </entry>
+    <entry name="LifeMode" type="String">
+      <label>Game of Life: random | edges (sparking border, blobs inside) | draw (click places cells)</label>
+      <default>random</default>
+    </entry>
+    <entry name="Paused" type="Bool">
+      <label>Freeze animations (clocks keep running)</label>
+      <default>false</default>
+    </entry>
+    <entry name="ClockFont" type="String">
+      <label>Font family for clocks</label>
+      <default>JetBrains Mono</default>
+    </entry>
+    <entry name="ClockBottomMargin" type="Int">
+      <label>Minimum gap between the night clock and the panel, in reference pixels (2560x1600)</label>
+      <default>40</default>
+    </entry>
+    <entry name="ElementGalaxy" type="Bool">
+      <label>Rotating galaxy: animate (off = frozen)</label>
+      <default>true</default>
+    </entry>
+    <entry name="ElementBars" type="Bool">
+      <label>Night bars (cubes): animate (off = frozen)</label>
+      <default>true</default>
+    </entry>
+    <entry name="ElementPipes" type="Bool">
+      <label>Night VU pipes: animate (off = frozen)</label>
+      <default>true</default>
+    </entry>
+    <entry name="ElementMarkers" type="Bool">
+      <label>J/M/I dot-row clock: animate (off = frozen)</label>
+      <default>true</default>
+    </entry>
+    <entry name="ElementMatrix" type="Bool">
+      <label>Day letter matrix: animate (off = frozen)</label>
+      <default>true</default>
+    </entry>
+    <entry name="ElementLife" type="Bool">
+      <label>Day Game of Life: animate (off = frozen)</label>
+      <default>true</default>
+    </entry>
+    <entry name="ElementTiles" type="Bool">
+      <label>Day progress tiles: animate (off = frozen)</label>
+      <default>true</default>
+    </entry>
+    <entry name="ElementBattery" type="Bool">
+      <label>Battery in the big day digits: animate (off = frozen)</label>
+      <default>true</default>
+    </entry>
+  </group>
+</kcfg>

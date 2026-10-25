@@ -1,0 +1,103 @@
+/* DotGrid for Zen Browser (and Firefox): the colours of the KDE theme, a dot grid
+   behind the tabs, JetBrains Mono, square corners. Day or night follows the
+   system colour scheme, which dotgrid-theme switches; nothing runs here.
+   Installed by ./install-browser.sh, imported from chrome/userChrome.css. */
+
+:root {
+  --dg-bg: #d6cdbc;
+  --dg-ink: #161614;
+  --dg-mute: #6e685c;
+  --dg-line: #a89f8c;
+  --dg-grid: #bdb3a0;
+  --dg-field: #e2dacb;
+  --dg-hover: #c9bfac;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --dg-bg: #141413;
+    --dg-ink: #e8e0d0;
+    --dg-mute: #5c5a54;
+    --dg-line: #3a3935;
+    --dg-grid: #2a2926;
+    --dg-field: #1e1e1c;
+    --dg-hover: #262523;
+  }
+}
+
+/* Zen paints these from the space gradient as inline styles; !important wins */
+:root, #browser {
+  color-scheme: light dark !important;
+  --zen-main-browser-background:
+    radial-gradient(circle at center, var(--dg-grid) 1.1px, transparent 1.6px) 0 0 / 16px 16px,
+    var(--dg-bg) !important;
+  --zen-main-browser-background-toolbar: var(--zen-main-browser-background) !important;
+  --zen-grainy-background-opacity: 0 !important;
+  --zen-primary-color: var(--dg-ink) !important;
+  --toolbox-textcolor: var(--dg-ink) !important;
+  --toolbar-color: var(--dg-ink) !important;
+  --zen-colors-primary: var(--dg-hover) !important;
+  --zen-colors-secondary: var(--dg-line) !important;
+  --zen-colors-tertiary: var(--dg-field) !important;
+  --zen-colors-hover-bg: var(--dg-hover) !important;
+  --zen-colors-primary-foreground: var(--dg-ink) !important;
+  --zen-colors-border: var(--dg-line) !important;
+  --zen-colors-input-bg: var(--dg-field) !important;
+  --zen-dialog-background: var(--dg-field) !important;
+  --zen-urlbar-background: var(--dg-field) !important;
+  --zen-toolbar-element-bg: var(--dg-hover) !important;
+  --zen-toolbar-element-bg-hover: var(--dg-hover) !important;
+  --toolbarbutton-background-color-hover: var(--dg-hover) !important;
+  --tab-selected-bgcolor: var(--dg-field) !important;
+  --tab-hover-background-color: var(--dg-hover) !important;
+  --focus-outline-color: var(--dg-ink) !important;
+  --zen-border-radius: 2px !important;
+  --tab-border-radius: 2px !important;
+  --border-radius-medium: 2px !important;
+  --arrowpanel-border-radius: 2px !important;
+  --arrowpanel-background: var(--dg-field) !important;
+  --arrowpanel-color: var(--dg-ink) !important;
+  --arrowpanel-border-color: var(--dg-line) !important;
+  --panel-separator-color: var(--dg-line) !important;
+  --toolbar-field-background-color: var(--dg-field) !important;
+  --toolbar-field-focus-background-color: var(--dg-field) !important;
+  --toolbar-field-color: var(--dg-ink) !important;
+  --toolbar-field-focus-color: var(--dg-ink) !important;
+  font-family: "JetBrains Mono", monospace !important;
+}
+
+/* Zen sets the space gradient on the background elements themselves, not on
+   :root, so the variables above never reach them: paint the layers directly */
+.zen-browser-generic-background::before,
+.zen-browser-generic-background::after {
+  background:
+    radial-gradient(circle at center, var(--dg-grid) 1.1px, transparent 1.6px) 0 0 / 16px 16px,
+    var(--dg-bg) !important;
+  background-blend-mode: normal !important;
+}
+.zen-browser-grain {
+  display: none !important;
+}
+
+/* text everywhere in the browser frame, not in pages */
+#navigator-toolbox, #urlbar, #urlbar-input, .tab-label, menupopup, panel, tooltip {
+  font-family: "JetBrains Mono", monospace !important;
+  font-feature-settings: "liga" 0, "calt" 0 !important;
+}
+
+/* the selected tab: a flat field with a 1 px outline instead of a shadow */
+.tabbrowser-tab[selected] .tab-background,
+.tabbrowser-tab[multiselected] .tab-background {
+  background: var(--dg-field) !important;
+  box-shadow: none !important;
+  outline: 1px solid var(--dg-line) !important;
+  outline-offset: -1px !important;
+}
+
+/* the page sits on the grid with a thin frame and no drop shadow */
+#tabbrowser-tabbox .browserStack > browser,
+.browserSidebarContainer {
+  box-shadow: none !important;
+}
+.browserSidebarContainer {
+  outline: 1px solid var(--dg-line) !important;
+}

@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""dotgrid-live: command line for the DotGrid Live wallpaper.
+
+  dotgrid-live status [--json]
+  dotgrid-live pause | resume | toggle
+  dotgrid-live theme day|night|schedule   whole DotGrid theme, the wallpaper follows
+  dotgrid-live mode auto|day|night        wallpaper only (auto = follow the theme)
+  dotgrid-live bars audio|generative|system
+  dotgrid-live fps 15|24|30|60             both day and night
+  dotgrid-live fps day|night 15|24|30|60   at night: the whole scene; by day: the letter flicker
+  dotgrid-live opt ELEMENT KEY VALUE       element details, e.g. opt galaxy stars 1500
+      galaxy stars 500..4000 | twinkle on|off | pulse on|off | hz 2..30
+      bars speed|fall|sensitivity 0.1..4   pipes speed|peak_fall 0.2..4
+      matrix interval 0.3..30 (s) | column_every 0..200 (0 never) | flicker 1..30
+      life density 2..60 (%) | warmup 0..100 | stale 5..500     tiles source minute|hour|day
+  dotgrid-live lang ru|en                  language of the tray, settings and help
+  dotgrid-live autopause powersaver|battery|locked on|off
+  dotgrid-live autopause battery-threshold N
+  dotgrid-live element galaxy|bars|pipes|markers|matrix|life|tiles|battery on|off
+  dotgrid-live galaxy-turn MINUTES
+  dotgrid-live life-rate GENERATIONS_PER_SECOND
+  dotgrid-live life-mode random|edges|draw
+  dotgrid-live metrics on|off             background load log, once a minute
+  dotgrid-live metrics limit MB           size limit of the hourly archive (default 4 MB)
+  dotgrid-live metrics [--json]           summary: archive + current hour
+  dotgrid-live metrics hourly [DAYS]      one line per hour (default: last 2 days)
+
+Talks to dotgrid-livectl over DBus. When the service is not running, the
+setting is written to ~/.config/dotgrid/live.json directly (the wallpaper
+watches that file); autopause needs the service.
+"""
+import json
+import os
+import sys
+
+SERVICE, PATH, IFACE = "org.dotgrid.Live", "/org/dotgrid/Live", "org.dotgrid.Live"
+
+
+def usage(code=2):
+    print(__doc__.split("\n\n")[1], file=sys.stderr if code else sys.stdout)
+    sys.exit(code)
+
+
+def onoff(v):
+    if v not in ("on", "off"):
+        usage()
+    return v == "on"
+
+
+def parse(args):
+    """-> ("call", method) or ("set", key, value) or ("status", as_json)"""
+    if not args:
+        usage()
+    cmd, rest = args[0], args[1:]
+    if cmd == "status":
+        return ("status", rest == ["--json"])
+    if cmd in ("pause", "resume", "toggle") and not rest:
+        return ("call", cmd.capitalize())
+    if cmd == "theme" and len(rest) == 1 and rest[0] in ("day", "night", "schedule"):
+        return ("theme", rest[0])
+    if len(rest) == 1 and cmd in ("mode", "bars", "life-mode"):
+        return ("set", cmd.replace("-", "_"), rest[0])
+    if len(rest) == 1 and cmd == "fps":
+        return ("set", "fps", int(rest[0]))
+    if len(rest) == 2 and cmd == "fps" and rest[0] in ("day", "night"):
+        return ("set", "fps." + rest[0], int(rest[1]))
+    if len(rest) == 3 and cmd == "opt":
+        v = rest[2]
+        if v in ("on", "off"):
+            v = v == "on"
+        else:
+            try:
+                v = float(v) if "." in v else int(v)
+            except ValueError:
+                pass                 # a choice like "hour"
+        return ("set", f"opts.{rest[0]}.{rest[1]}", v)
+    if len(rest) == 1 and cmd == "lang":
+        return ("set", "language", rest[0])
+    if len(rest) == 1 and cmd in ("galaxy-turn", "life-rate"):
+        return ("set", {"galaxy-turn": "galaxy_turn_minutes", "life-rate": "life_rate"}[cmd], float(rest[0]))
+    if len(rest) == 2 and cmd == "autopause":
+        if rest[0] == "battery-threshold":
+            return ("set", "autopause.battery_threshold", int(rest[1]))
+        return ("set", "autopause." + rest[0], onoff(rest[1]))
+    if cmd == "metrics" and rest in (["on"], ["off"]):
+        return ("set", "metrics", rest[0] == "on")
+    if cmd == "metrics" and len(rest) == 2 and rest[0] == "limit":
+        return ("set", "metrics_max_mb", float(rest[1]))
+    if cmd == "metrics" and rest in ([], ["--json"]):
+        return ("metrics", rest == ["--json"])
+    if cmd == "metrics" and rest[:1] == ["hourly"] and len(rest) <= 2:
+        return ("hourly", float(rest[1]) if len(rest) == 2 else 2.0)
+    if len(rest) == 2 and cmd == "element":
+        return ("set", "elements." + rest[0], onoff(rest[1]))
+    usage()
+
+
+def bus_proxy():
+    try:
+        import dbus
+        bus = dbus.SessionBus()
+        if not bus.name_has_owner(SERVICE):
+            return None
+        return dbus.Interface(bus.get_object(SERVICE, PATH), IFACE)
+    except Exception:
+        return None
+
+
+def offline():
+    """Shared load/validate/save from the service script next to this one."""
+    from importlib.machinery import SourceFileLoader
+    here = os.path.dirname(os.path.realpath(__file__))
+    return SourceFileLoader("dotgrid_livectl", os.path.join(here, "dotgrid-livectl")).load_module()
+
+
+def print_status(st, as_json):
+    if as_json:
+        print(json.dumps(st, indent=2, ensure_ascii=False))
+        return
+    if not st.get("daemon"):
+        state = "paused" if st["paused"] else "running"
+        print(f"state:     {state} (dotgrid-livectl not running: no autopause)")
+    elif st["effective_paused"]:
+        why = ["manual"] if st["paused"] else []
+        why += st["auto_reasons"]
+        print(f"state:     paused ({', '.join(why)})")
+    else:
+        print("state:     running")
+    eff = st.get("effective_mode")
+    print(f"mode:      {st['mode']}" + (f" -> {eff}" if st["mode"] == "auto" and eff else ""))
+    fps = st["fps"] if isinstance(st["fps"], dict) else {"day": st["fps"], "night": st["fps"]}
+    print(f"bars:      {st['bars']}   fps: night {fps['night']}, day {fps['day']}")
+    off = [k for k, v in st["elements"].items() if not v]
+    print(f"elements:  all on" if not off else f"elements:  off: {', '.join(off)}")
+    print(f"galaxy:    {st['galaxy_turn_minutes']:g} min/turn   life: {st['life_mode']}, {st['life_rate']:g} gen/s")
+    ap = st["autopause"]
+    rules = [r for r in ("powersaver", "battery", "locked") if ap[r]]
+    print(f"autopause: {', '.join(rules) or 'off'} (battery < {ap['battery_threshold']}%)")
+
+
+def load_snapshots():
+    """The archive (all finished days), today's hours and the current hour."""
+    import lzma
+    mod = offline()
+    snaps, archive_bytes = [], 0
+    for path, opener in ((mod.ARCHIVE, lzma.open), (mod.TODAY, open)):
+        if not os.path.exists(path):
+            continue
+        archive_bytes += os.path.getsize(path)
+        try:
+            with opener(path, "rb") as f:
+                for line in f.read().splitlines():
+                    try:
+                        snaps.append(json.loads(line))
+                    except ValueError:
+                        pass
+        except (OSError, lzma.LZMAError):
+            pass
+    rows = []
+    try:
+        with open(mod.METRICS) as f:
+            for line in f:
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    done = snaps[-1]["hour"] if snaps else ""
+    import time as _t
+    hours = {}
+    for r in rows:
+        h = _t.strftime("%Y-%m-%dT%H", _t.localtime(r["ts"]))
+        if h > done:
+            hours.setdefault(h, []).append(r)
+    for h in sorted(hours):
+        s = mod.hourly_snapshot(hours[h], hours[h][0]["ts"])
+        s["partial"] = True
+        snaps.append(s)
+    return snaps, archive_bytes, mod.load_config()["metrics_max_mb"]
+
+
+def state_label(k):
+    if k.startswith("paused:"):
+        return "paused (" + k[7:].replace("+", ", ") + ")"
+    mode, bars, fps = k.split(":")
+    return f"{mode}, bars {bars.replace('+audio', ' (audio on)')}, {fps} fps"
+
+
+def metrics_summary(as_json):
+    snaps, archive_bytes, cap_mb = load_snapshots()
+    if not snaps:
+        print("no samples yet; turn it on: dotgrid-live metrics on")
+        return
+    agg = {}
+    for s in snaps:
+        for k, g in s["state"].items():
+            a = agg.setdefault(k, {"min": 0, "cpu_sum": 0.0, "cpu_n": 0, "w_sum": 0.0, "w_n": 0})
+            a["min"] += g["min"]
+            if g["ps_cpu"] is not None:
+                a["cpu_sum"] += g["ps_cpu"] * g["ps_n"]
+                a["cpu_n"] += g["ps_n"]
+            if g["bat_w"] is not None:
+                a["w_sum"] += g["bat_w"] * g["bat_min"]
+                a["w_n"] += g["bat_min"]
+    groups = {state_label(k): {"minutes": a["min"],
+                               "plasmashell_cpu": round(a["cpu_sum"] / a["cpu_n"], 2) if a["cpu_n"] else None,
+                               "battery_w": round(a["w_sum"] / a["w_n"], 2) if a["w_n"] else None,
+                               "battery_minutes": a["w_n"]}
+              for k, a in sorted(agg.items(), key=lambda kv: -kv[1]["min"])}
+    # memory trend over the longest-lived plasmashell
+    runs = {}
+    for s in snaps:
+        if s.get("ps_rss_mb"):
+            runs.setdefault(s.get("ps_pid"), []).append(s)
+    run = max(runs.values(), key=len) if runs else []
+    mem = None
+    if len(run) >= 2:
+        mem = {"hours": len(run), "first_mb": run[0]["ps_rss_mb"][2], "last_mb": run[-1]["ps_rss_mb"][2],
+               "max_mb": max(s["ps_rss_mb"][1] for s in run),
+               "mb_per_hour": round((run[-1]["ps_rss_mb"][2] - run[0]["ps_rss_mb"][2]) / (len(run) - 1), 2)}
+    out = {"hours": len(snaps), "from": snaps[0]["hour"], "to": snaps[-1]["hour"],
+           "archive_kb": round(archive_bytes / 1024, 1), "archive_limit_mb": cap_mb,
+           "groups": groups, "plasmashell_memory": mem}
+    if as_json:
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        return
+    print(f"{out['from']} .. {out['to']}, {out['hours']} h; archive {out['archive_kb']} KB of {cap_mb:g} MB"
+          "   (% = one core, W = battery draw when discharging)")
+    for label, g in groups.items():
+        w = f"{g['battery_w']} W over {g['battery_minutes']} min" if g["battery_w"] else "-"
+        cpu = "-" if g["plasmashell_cpu"] is None else f"{g['plasmashell_cpu']}%"
+        print(f"  {label:46} {g['minutes']:6} min  plasmashell {cpu:7}  battery {w}")
+    if mem:
+        print(f"  plasmashell RSS {mem['first_mb']} -> {mem['last_mb']} MB (max {mem['max_mb']}), "
+              f"{mem['mb_per_hour']} MB/h over {mem['hours']} h of one process")
+
+
+def metrics_hourly(days):
+    snaps, _, _ = load_snapshots()
+    import time as _t
+    since = _t.strftime("%Y-%m-%dT%H", _t.localtime(_t.time() - days * 86400))
+    print("hour            min  mostly                              plasmashell  service  battery       RSS MB")
+    for s in snaps:
+        if s["hour"] < since:
+            continue
+        top = max(s["state"].items(), key=lambda kv: kv[1]["min"])[0]
+        w = f"{s['bat_w']} W" if s.get("bat_w") else "-"
+        pct = f" {s['bat_pct'][0]}->{s['bat_pct'][1]}%" if s.get("bat_pct") else ""
+        rss = "-" if not s.get("ps_rss_mb") else f"{s['ps_rss_mb'][2]}"
+        cpu = "-" if s.get("ps_cpu") is None else f"{s['ps_cpu']}%"
+        svc = "-" if s.get("svc_cpu") is None else f"{s['svc_cpu']}%"
+        mark = " (now)" if s.get("partial") else ""
+        print(f"{s['hour'].replace('T', ' ')}h {s['min']:4}  {state_label(top)[:34]:34}  {cpu:>11}  {svc:>7}  "
+              f"{(w + pct):12}  {rss}{mark}")
+
+
+def main():
+    try:
+        action = parse(sys.argv[1:])
+    except ValueError:
+        usage()
+    if action[0] == "metrics":
+        metrics_summary(action[1])
+        return 0
+    if action[0] == "hourly":
+        metrics_hourly(action[1])
+        return 0
+    proxy = bus_proxy()
+
+    if action[0] == "status":
+        if proxy:
+            st = json.loads(str(proxy.Status()))
+        else:
+            mod = offline()
+            st = mod.load_config()
+            st["daemon"] = False
+        print_status(st, action[1])
+        return 0
+
+    if action[0] == "theme":
+        if proxy:
+            msg = str(proxy.Theme(action[1]))
+            if msg:
+                print(f"dotgrid-live: {msg}", file=sys.stderr)
+            return 0
+        # no service: run the scripts directly, the wallpaper follows the state file
+        tool = "dotgrid-auto" if action[1] == "schedule" else "dotgrid-theme"
+        args = ["--force"] if action[1] == "schedule" else [action[1]]
+        os.execvp(tool, [tool] + args)
+
+    if proxy:
+        if action[0] == "call":
+            getattr(proxy, action[1])()
+            return 0
+        err = str(proxy.Set(action[1], json.dumps(action[2])))
+        if err:
+            print(f"dotgrid-live: {err}", file=sys.stderr)
+            return 1
+        return 0
+
+    # no service: edit live.json, the wallpaper picks it up
+    mod = offline()
+    cfg = mod.load_config()
+    if action[0] == "call":
+        key, value = "paused", {"Pause": True, "Resume": False, "Toggle": not cfg["paused"]}[action[1]]
+    else:
+        key, value = action[1], action[2]
+    try:
+        parts, value = mod.validate(key, value)
+    except (ValueError, TypeError) as e:
+        print(f"dotgrid-live: {e}", file=sys.stderr)
+        return 1
+    node = cfg
+    for p in parts[:-1]:
+        node = node[p]
+    node[parts[-1]] = value
+    mod.save_config(cfg)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

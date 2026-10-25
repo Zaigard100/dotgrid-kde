@@ -1,0 +1,18 @@
+{
+    "KPackageStructure": "Plasma/Wallpaper",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "DotGrid"
+            }
+        ],
+        "Description": "Living DotGrid wallpaper: day/night composition with clocks",
+        "Description[ru]": "Живые обои DotGrid: композиция день/ночь с часами",
+        "EnabledByDefault": true,
+        "Icon": "preferences-desktop-wallpaper",
+        "Id": "org.dotgrid.live",
+        "License": "GPL-2.0-or-later",
+        "Name": "DotGrid Live",
+        "Version": "0.1.0"
+    }
+}

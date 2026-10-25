@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""Picks the DotGrid theme for the time of day: day from sunrise to sunset.
+
+  dotgrid-auto            switch only when a new day or night has begun
+  dotgrid-auto --force    apply the theme for now, whatever is on
+  dotgrid-auto --show     print sunrise, sunset and where the place comes from
+  dotgrid-auto --coords   print "LAT LON" (for the login screen)
+
+Sun times are computed here, without the internet. The place is the main city
+of the system time zone (zone1970.tab); LAT= and LON= in
+~/.config/dotgrid/schedule override it, and SCHEDULE=hours there switches at
+DAY_AT / NIGHT_AT o'clock instead. A manual "dotgrid-theme day|night" lasts
+until the next sunrise or sunset: only a new period switches the theme.
+"""
+import datetime as dt
+import math
+import os
+import re
+import subprocess
+import sys
+
+HOME = os.path.expanduser("~")
+CFG = os.path.join(HOME, ".config/dotgrid/schedule")
+STATE_DIR = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state")
+STATE = os.path.join(STATE_DIR, "dotgrid-theme")      # the theme that is on
+LAST = os.path.join(STATE_DIR, "dotgrid-auto")        # the period last switched for
+THEME = os.path.join(HOME, ".local/bin/dotgrid-theme")
+ZONES = "/usr/share/zoneinfo/zone1970.tab"
+
+
+def read_cfg():
+    cfg = {"SCHEDULE": "sun", "DAY_AT": "8", "NIGHT_AT": "20", "LAT": "", "LON": ""}
+    try:
+        for line in open(CFG):
+            m = re.match(r"\s*([A-Z_]+)=['\"]?([^'\"#\n]*)", line)
+            if m:
+                cfg[m.group(1)] = m.group(2).strip()
+    except OSError:
+        pass
+    return cfg
+
+
+def timezone():
+    tz = os.environ.get("TZ", "").lstrip(":")
+    if tz:
+        return tz
+    link = os.path.realpath("/etc/localtime")
+    if "zoneinfo/" in link:
+        return link.split("zoneinfo/", 1)[1]
+    try:
+        return open("/etc/timezone").read().strip()
+    except OSError:
+        return ""
+
+
+def dms(s, deg_digits):
+    """'+5545' or '-0373702' -> degrees."""
+    sign = -1 if s[0] == "-" else 1
+    s = s[1:]
+    d, rest = int(s[:deg_digits]), s[deg_digits:]
+    m = int(rest[:2])
+    sec = int(rest[2:4]) if len(rest) > 2 else 0
+    return sign * (d + m / 60 + sec / 3600)
+
+
+def place(cfg):
+    """(lat, lon, where from) or None."""
+    try:
+        return float(cfg["LAT"]), float(cfg["LON"]), "schedule"
+    except ValueError:
+        pass
+    tz = timezone()
+    try:
+        for line in open(ZONES):
+            if line.startswith("#"):
+                continue
+            f = line.split("\t")
+            if len(f) >= 3 and f[2].strip() == tz:
+                m = re.fullmatch(r"([+-]\d+)([+-]\d+)", f[1])
+                lat, lon = m.group(1), m.group(2)
+                return dms(lat, 2), dms(lon, 3), f"time zone {tz}"
+    except (OSError, AttributeError):
+        pass
+    return None
+
+
+def sun_times(day, lat, lon):
+    """Sunrise and sunset (aware UTC datetimes) on a local date; a 'day' or
+    'night' string instead when the sun does not rise or set (polar)."""
+    epoch = dt.datetime(2000, 1, 1, 12, tzinfo=dt.timezone.utc)
+    n = (dt.datetime(day.year, day.month, day.day, 12, tzinfo=dt.timezone.utc) - epoch).days
+    j = n - lon / 360
+    m = math.radians((357.5291 + 0.98560028 * j) % 360)
+    c = 1.9148 * math.sin(m) + 0.02 * math.sin(2 * m) + 0.0003 * math.sin(3 * m)
+    lam = math.radians((math.degrees(m) + c + 180 + 102.9372) % 360)
+    transit = j + 0.0053 * math.sin(m) - 0.0069 * math.sin(2 * lam)
+    dec = math.asin(math.sin(lam) * math.sin(math.radians(23.4397)))
+    phi = math.radians(lat)
+    cos_w = (math.sin(math.radians(-0.833)) - math.sin(phi) * math.sin(dec)) / (math.cos(phi) * math.cos(dec))
+    if cos_w < -1:
+        return "day"
+    if cos_w > 1:
+        return "night"
+    w = math.degrees(math.acos(cos_w)) / 360
+    return epoch + dt.timedelta(days=transit - w), epoch + dt.timedelta(days=transit + w)
+
+
+def schedule(now, cfg):
+    """(theme, period key, description). The key names the day or night that is
+    going on now; a new key means a sunrise or sunset has passed."""
+    today = now.date()
+    yesterday = today - dt.timedelta(days=1)
+    pl = place(cfg) if cfg["SCHEDULE"] != "hours" else None
+    if pl:
+        lat, lon, src = pl
+        st = sun_times(today, lat, lon)
+        if isinstance(st, str):
+            return st, f"{st} {today}", f"{lat:.2f}, {lon:.2f} ({src}): polar {st}"
+        rise, sset = (t.astimezone() for t in st)
+        info = f"{lat:.2f}, {lon:.2f} ({src}): sunrise {rise:%H:%M}, sunset {sset:%H:%M}"
+        if rise <= now < sset:
+            return "day", f"day {today}", info
+        return "night", f"night {today if now >= sset else yesterday}", info
+    day_at, night_at = int(cfg["DAY_AT"]), int(cfg["NIGHT_AT"])
+    info = f"fixed hours: day {day_at}:00, night {night_at}:00"
+    if day_at <= now.hour < night_at:
+        return "day", f"day {today}", info
+    return "night", f"night {today if now.hour >= night_at else yesterday}", info
+
+
+def read(path):
+    try:
+        return open(path).read().strip()
+    except OSError:
+        return ""
+
+
+def main():
+    arg = sys.argv[1] if len(sys.argv) > 1 else ""
+    cfg = read_cfg()
+    now = dt.datetime.now().astimezone()
+    if arg == "--coords":
+        pl = place(cfg)
+        if not pl:
+            sys.exit(1)
+        print(f"{pl[0]:.4f} {pl[1]:.4f}")
+        return
+    theme, key, info = schedule(now, cfg)
+    if arg == "--show":
+        print(f"{info}\nnow: {theme} (theme on: {read(STATE) or 'unknown'})")
+        return
+    new_period = read(LAST) != key
+    if arg == "--force" or (new_period and read(STATE) != theme):
+        print(f"dotgrid-auto: {theme}", flush=True)
+        subprocess.run([THEME, theme])
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(LAST, "w") as f:
+        f.write(key + "\n")
+
+
+if __name__ == "__main__":
+    main()

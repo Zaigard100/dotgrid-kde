@@ -1,0 +1,187 @@
+import QtQuick 2.15
+
+// DotGrid SDDM. The greeter runs before login as the sddm user and cannot see
+// the user's theme state, so day/night is chosen by the sun: the installer
+// fills in the place from dotgrid-auto (or the fixed hours with
+// SCHEDULE=hours in ~/.config/dotgrid/schedule). The background is the
+// static DotGrid composition (day.png / night.png, no clocks in them); the
+// login form sits on a plain card so it reads on top of it.
+Rectangle {
+    id: root
+    width: 1280
+    height: 800
+
+    readonly property bool night: isNight(new Date())
+    readonly property color bg: night ? "#0a0a0a" : "#d6cdbc"
+    readonly property color fg: night ? "#e8e0d0" : "#161614"
+    readonly property color mute: night ? "#5c5a54" : "#6e685c"
+    readonly property string mono: "JetBrains Mono"
+    readonly property real u: Math.max(0.5, height / 1600)   // 1 at 2560x1600
+    // the last user SDDM remembers, else the default from theme.conf
+    // (written by install-sddm.sh), so the name is always filled in
+    readonly property string defaultUser: userModel.lastUser
+        || (typeof config !== "undefined" && config.defaultUser ? config.defaultUser : "")
+    property bool failed: false
+
+    color: bg
+
+    // the same sunrise equation as dotgrid-auto; lat/lon are NaN without a place
+    function isNight(now) {
+        const lat = @LAT@, lon = @LON@
+        if (isNaN(lat) || isNaN(lon))
+            return now.getHours() < @DAY_AT@ || now.getHours() >= @NIGHT_AT@
+        const rad = Math.PI / 180, epoch = Date.UTC(2000, 0, 1, 12)
+        const n = Math.round((Date.UTC(now.getFullYear(), now.getMonth(), now.getDate(), 12) - epoch) / 86400000)
+        const j = n - lon / 360
+        const m = ((357.5291 + 0.98560028 * j) % 360) * rad
+        const c = 1.9148 * Math.sin(m) + 0.02 * Math.sin(2 * m) + 0.0003 * Math.sin(3 * m)
+        const lam = ((m / rad + c + 180 + 102.9372) % 360) * rad
+        const transit = j + 0.0053 * Math.sin(m) - 0.0069 * Math.sin(2 * lam)
+        const dec = Math.asin(Math.sin(lam) * Math.sin(23.4397 * rad))
+        const cosW = (Math.sin(-0.833 * rad) - Math.sin(lat * rad) * Math.sin(dec)) / (Math.cos(lat * rad) * Math.cos(dec))
+        if (cosW < -1) return false          // polar day
+        if (cosW > 1) return true            // polar night
+        const w = Math.acos(cosW) / rad / 360
+        const t = now.getTime()
+        return t < epoch + (transit - w) * 86400000 || t >= epoch + (transit + w) * 86400000
+    }
+
+    function doLogin() {
+        root.failed = false
+        sddm.login(userField.text, pwField.text, sessionModel.lastIndex)
+    }
+
+    Connections {
+        target: sddm
+        function onLoginFailed() {
+            root.failed = true
+            pwField.text = ""
+            pwField.forceActiveFocus()
+        }
+    }
+
+    Image {
+        anchors.fill: parent
+        source: root.night ? "night.png" : "day.png"
+        fillMode: Image.PreserveAspectCrop
+        smooth: true
+    }
+
+    Rectangle {
+        id: card
+        anchors.centerIn: parent
+        width: 760 * root.u
+        height: content.height + 96 * root.u
+        color: root.bg
+        border.color: root.fg
+        border.width: Math.max(2, 3 * root.u)
+
+        Column {
+            id: content
+            anchors.centerIn: parent
+            spacing: 22 * root.u
+
+            Text {
+                id: clock
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: Qt.formatTime(new Date(), "HH:mm")
+                color: root.fg
+                font.family: root.mono
+                font.bold: true
+                font.pixelSize: 150 * root.u
+                font.letterSpacing: 8 * root.u
+                Timer {
+                    interval: 1000; running: true; repeat: true
+                    onTriggered: {
+                        clock.text = Qt.formatTime(new Date(), "HH:mm")
+                        dateText.text = Qt.formatDate(new Date(), "yyyy.MM.dd  |  ddd").toUpperCase()
+                    }
+                }
+            }
+
+            Text {
+                id: dateText
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: Qt.formatDate(new Date(), "yyyy.MM.dd  |  ddd").toUpperCase()
+                color: root.mute
+                font.family: root.mono
+                font.letterSpacing: 4 * root.u
+                font.pixelSize: 30 * root.u
+            }
+
+            Item { width: 1; height: 18 * root.u }
+
+            Repeater {
+                model: [
+                    { label: "USER", password: false },
+                    { label: "PASS", password: true }
+                ]
+                Row {
+                    required property var modelData
+                    spacing: 20 * root.u
+                    Text {
+                        width: 120 * root.u; height: 64 * root.u
+                        verticalAlignment: Text.AlignVCenter
+                        text: modelData.label; color: root.mute
+                        font.family: root.mono; font.bold: true; font.pixelSize: 28 * root.u; font.letterSpacing: 3 * root.u
+                    }
+                    Rectangle {
+                        width: 480 * root.u; height: 64 * root.u
+                        color: "transparent"
+                        border.color: modelData.password && root.failed ? "#c85a50" : root.fg
+                        border.width: Math.max(2, 2 * root.u)
+                        TextInput {
+                            id: input
+                            anchors.fill: parent; anchors.margins: 14 * root.u
+                            verticalAlignment: TextInput.AlignVCenter
+                            echoMode: modelData.password ? TextInput.Password : TextInput.Normal
+                            passwordCharacter: "*"
+                            text: modelData.password ? "" : root.defaultUser
+                            color: root.fg
+                            font.family: root.mono; font.pixelSize: 30 * root.u
+                            selectionColor: root.fg; selectedTextColor: root.bg
+                            Keys.onReturnPressed: modelData.password ? root.doLogin() : pwField.forceActiveFocus()
+                            Keys.onEnterPressed: modelData.password ? root.doLogin() : pwField.forceActiveFocus()
+                            Component.onCompleted: {
+                                if (modelData.password) pwField = input; else userField = input
+                            }
+                        }
+                    }
+                }
+            }
+
+            Text {
+                anchors.horizontalCenter: parent.horizontalCenter
+                height: 34 * root.u
+                text: root.failed ? "ACCESS DENIED" : ""
+                color: "#c85a50"
+                font.family: root.mono; font.bold: true; font.pixelSize: 26 * root.u; font.letterSpacing: 3 * root.u
+            }
+
+            Row {
+                anchors.horizontalCenter: parent.horizontalCenter
+                spacing: 56 * root.u
+                Text {
+                    visible: sddm.canReboot
+                    text: "[ REBOOT ]"; color: root.mute
+                    font.family: root.mono; font.pixelSize: 24 * root.u; font.letterSpacing: 3 * root.u
+                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: sddm.reboot() }
+                }
+                Text {
+                    visible: sddm.canPowerOff
+                    text: "[ POWER OFF ]"; color: root.mute
+                    font.family: root.mono; font.pixelSize: 24 * root.u; font.letterSpacing: 3 * root.u
+                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: sddm.powerOff() }
+                }
+            }
+        }
+    }
+
+    // set by the two input rows above
+    property Item userField
+    property Item pwField
+
+    Component.onCompleted: {
+        if (userField.text === "") userField.forceActiveFocus(); else pwField.forceActiveFocus()
+    }
+}

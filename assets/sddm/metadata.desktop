@@ -1,0 +1,13 @@
+[SddmGreeterTheme]
+Name=DotGrid
+Description=Dot grid login screen, day and night
+Author=DotGrid
+Version=1.0
+Type=sddm-theme
+Screenshot=preview.png
+MainScript=Main.qml
+ConfigFile=theme.conf
+TranslationsDirectory=translations
+Theme-Id=dotgrid
+Theme-API=2.0
+QtVersion=6

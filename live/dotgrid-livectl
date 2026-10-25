@@ -1,0 +1,1770 @@
+#!/usr/bin/env python3
+"""dotgrid-livectl: the one source of truth for the DotGrid Live wallpaper.
+
+Keeps the state (manual pause, mode, bars, fps, elements, speeds) in
+~/.config/dotgrid/live.json, computes the automatic pause from power profile,
+battery and screen lock, shows a tray icon (StatusNotifierItem), registers the
+global shortcut and exports everything on the session bus:
+
+    service org.dotgrid.Live, object /org/dotgrid/Live, interface org.dotgrid.Live
+      Status() -> s            full state as JSON
+      Pause() / Resume() / Toggle()
+      Set(s key, s json) -> s  change one setting, returns "" or an error
+      Theme(s day|night|schedule) -> s   switch the whole DotGrid theme
+                               (dotgrid-theme / dotgrid-auto); the wallpaper follows
+      signal Changed(s json)   after every change, same JSON as Status()
+
+      signal Levels(ay)        external data for the night bars and pipes:
+                               [source, 26 bars, 4 pipes], 0..255 each;
+                               source 0 none (wallpaper animates on its own),
+                               1 audio spectrum, 2 system load
+
+The wallpaper listens to Changed; without this service it falls back to
+live.json and its own defaults (no autopause, no audio/system data).
+"""
+import copy
+import json
+import math
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+from collections import deque
+
+from PySide6.QtCore import (QByteArray, QFileSystemWatcher, QObject, QPointF, QProcess, QRectF,
+                            QSocketNotifier, Qt, QTimer, ClassInfo, Signal, Slot, SLOT)
+from PySide6.QtDBus import QDBusConnection, QDBusMessage, QDBusObjectPath
+from PySide6.QtGui import QActionGroup, QColor, QFont, QIcon, QPainter, QPixmap
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+                               QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QMenu,
+                               QPushButton, QScrollArea, QSlider, QSpinBox, QSystemTrayIcon, QTabWidget,
+                               QTextBrowser, QVBoxLayout, QWidget)
+
+VERSION = "0.1.0"
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "dotgrid", "live.json")
+STATE_HOME = os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))
+THEME_STATE = os.path.join(STATE_HOME, "dotgrid-theme")
+METRICS = os.path.join(STATE_HOME, "dotgrid-live", "metrics.jsonl")
+HOURLY_DIR = os.path.join(STATE_HOME, "dotgrid-live", "hourly")
+ARCHIVE = os.path.join(HOURLY_DIR, "hourly.jsonl.xz")   # every finished day, one xz stream per day
+TODAY = os.path.join(HOURLY_DIR, "today.jsonl")         # the hours of the current day, plain
+
+ELEMENTS = ["galaxy", "bars", "pipes", "markers", "matrix", "life", "tiles", "battery"]
+DEFAULTS = {
+    "paused": False,
+    "mode": "auto",                 # auto | day | night
+    "bars": "audio",                # audio | generative | system
+    # frames per second; at night the whole scene and the audio analysis,
+    # by day only the letter flicker (Life and the tiles keep their own pace)
+    "fps": {"day": 15, "night": 15},
+    "elements": {e: True for e in ELEMENTS},
+    "galaxy_turn_minutes": 4.0,
+    "life_rate": 2.5,
+    "life_mode": "random",          # random | edges | draw
+    "opts": {                       # per-element details, see OPTS
+        "galaxy": {"stars": 2600, "twinkle": True, "pulse": True, "hz": 10},
+        "bars": {"speed": 1.0, "fall": 1.0, "sensitivity": 1.0},
+        "pipes": {"speed": 1.0, "peak_fall": 1.0},
+        "matrix": {"interval": 1.4, "column_every": 18, "flicker": 6},
+        "life": {"density": 16, "warmup": 12, "stale": 30},
+        "tiles": {"source": "minute"},
+    },
+    "autopause": {
+        "powersaver": True,         # power profile "power-saver"
+        "battery": True,            # on battery and below battery_threshold
+        "battery_threshold": 30,
+        "locked": True,             # screen locked / session inactive or idle
+    },
+    "shortcut": "Meta+Shift+P",
+    "language": "ru",               # ru | en: tray, settings, help
+    "metrics": False,               # log load once a minute to METRICS
+    "metrics_max_mb": 4.0,          # size limit of the hourly archive (HOURLY_DIR)
+}
+CHOICES = {"mode": ["auto", "day", "night"], "bars": ["audio", "generative", "system"],
+           "fps": [15, 24, 30, 60], "life_mode": ["random", "edges", "draw"], "language": ["ru", "en"]}
+# per-element options: (element, key) -> (type, min, max) or list of choices
+OPTS = {
+    ("galaxy", "stars"): (int, 500, 4000),
+    ("galaxy", "twinkle"): (bool,),
+    ("galaxy", "pulse"): (bool,),
+    ("galaxy", "hz"): (int, 2, 30),
+    ("bars", "speed"): (float, 0.1, 4.0),
+    ("bars", "fall"): (float, 0.2, 4.0),
+    ("bars", "sensitivity"): (float, 0.3, 3.0),
+    ("pipes", "speed"): (float, 0.1, 4.0),
+    ("pipes", "peak_fall"): (float, 0.2, 4.0),
+    ("matrix", "interval"): (float, 0.3, 30.0),
+    ("matrix", "column_every"): (int, 0, 200),
+    ("matrix", "flicker"): (int, 1, 30),
+    ("life", "density"): (int, 2, 60),
+    ("life", "warmup"): (int, 0, 100),
+    ("life", "stale"): (int, 5, 500),
+    ("tiles", "source"): ["minute", "hour", "day"],
+}
+
+LANG = ["ru"]                       # current UI language, follows the config
+
+
+def T(ru, en):
+    """The UI string in the current language."""
+    return en if LANG[0] == "en" else ru
+
+
+def rule_name(r):
+    return {"powersaver": T("энергосбережение", "power saver"), "battery": T("батарея", "battery"),
+            "locked": T("экран заблокирован", "screen locked")}.get(r, r)
+
+
+def log(msg):
+    """One line to stderr, i.e. the journal under systemd."""
+    print(f"dotgrid-livectl: {msg}", file=sys.stderr, flush=True)
+
+
+def merge(base, extra):
+    """Defaults overlaid with whatever valid keys the file has."""
+    out = copy.deepcopy(base)
+    for k, v in (extra or {}).items():
+        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+            out[k] = merge(out[k], v)
+        elif k in out and not isinstance(out[k], dict):
+            out[k] = v
+    return out
+
+
+def load_config():
+    try:
+        with open(CONFIG) as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        raw = {}
+    if isinstance(raw.get("fps"), int):          # older files: one fps for both
+        raw["fps"] = {"day": raw["fps"], "night": raw["fps"]}
+    return merge(DEFAULTS, raw)
+
+
+def save_config(cfg):
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    tmp = CONFIG + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, CONFIG)
+
+
+def validate(key, value):
+    """Returns (path, value) to store or raises ValueError. "fps" alone sets
+    both day and night (the path then is ["fps"] with a dict value)."""
+    parts = key.split(".")
+    if key in ("mode", "bars", "life_mode", "language"):
+        if value not in CHOICES[key]:
+            raise ValueError(f"{key}: one of {', '.join(CHOICES[key])}")
+    elif parts[0] == "fps" and len(parts) <= 2:
+        v = int(value)
+        if v not in CHOICES["fps"]:
+            raise ValueError("fps: one of 15, 24, 30, 60")
+        if len(parts) == 1:
+            value = {"day": v, "night": v}
+        elif parts[1] in ("day", "night"):
+            value = v
+        else:
+            raise ValueError("fps.day or fps.night")
+    elif key in ("paused", "metrics"):
+        value = bool(value)
+    elif key == "galaxy_turn_minutes":
+        value = float(value)
+        if not 0.25 <= value <= 120:
+            raise ValueError("galaxy_turn_minutes: 0.25..120")
+    elif key == "metrics_max_mb":
+        value = float(value)
+        if not 0.1 <= value <= 100:
+            raise ValueError("metrics_max_mb: 0.1..100")
+    elif key == "life_rate":
+        value = float(value)
+        if not 0.2 <= value <= 20:
+            raise ValueError("life_rate: 0.2..20")
+    elif parts[0] == "elements" and len(parts) == 2 and parts[1] in ELEMENTS:
+        value = bool(value)
+    elif parts[0] == "opts" and len(parts) == 3 and (parts[1], parts[2]) in OPTS:
+        spec = OPTS[(parts[1], parts[2])]
+        if isinstance(spec, list):
+            if value not in spec:
+                raise ValueError(f"{key}: one of {', '.join(spec)}")
+        elif spec[0] is bool:
+            value = bool(value)
+        else:
+            value = spec[0](value)
+            if not spec[1] <= value <= spec[2]:
+                raise ValueError(f"{key}: {spec[1]}..{spec[2]}")
+    elif parts[0] == "autopause" and len(parts) == 2 and parts[1] in DEFAULTS["autopause"]:
+        if parts[1] == "battery_threshold":
+            value = int(value)
+            if not 1 <= value <= 100:
+                raise ValueError("battery_threshold: 1..100")
+        else:
+            value = bool(value)
+    else:
+        raise ValueError(f"unknown setting: {key}")
+    return parts, value
+
+
+class Sensors(QObject):
+    """Power profile, battery and lock state from the system/session buses."""
+    changed = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.sys = QDBusConnection.systemBus()
+        self.ses = QDBusConnection.sessionBus()
+        self.profile = None          # "power-saver" | "balanced" | "performance" | None
+        self.on_battery = False
+        self.percent = None
+        self.screensaver = False
+        self.locked = False
+        self.idle = False
+        self.session_active = True
+        self.session_path = self._find_session()
+        self.has_ppd = self._get(self.sys, "net.hadess.PowerProfiles", "/net/hadess/PowerProfiles",
+                                 "net.hadess.PowerProfiles", "ActiveProfile") is not None
+
+        watch = [
+            (self.sys, "org.freedesktop.UPower", "/org/freedesktop/UPower"),
+            (self.sys, "org.freedesktop.UPower", "/org/freedesktop/UPower/devices/DisplayDevice"),
+        ]
+        if self.has_ppd:
+            watch.append((self.sys, "net.hadess.PowerProfiles", "/net/hadess/PowerProfiles"))
+        if self.session_path:
+            watch.append((self.sys, "org.freedesktop.login1", self.session_path))
+        for bus, svc, path in watch:
+            bus.connect(svc, path, "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                        self, SLOT("onSignal(QDBusMessage)"))
+        self.ses.connect("org.freedesktop.ScreenSaver", "/ScreenSaver", "org.freedesktop.ScreenSaver",
+                         "ActiveChanged", self, SLOT("onSignal(QDBusMessage)"))
+        if not self.has_ppd:
+            # KDE PowerDevil keeps the profile itself when power-profiles-daemon is absent
+            self.ses.connect("org.kde.Solid.PowerManagement", "/org/kde/Solid/PowerManagement/Actions/PowerProfile",
+                             "org.kde.Solid.PowerManagement.Actions.PowerProfile", "currentProfileChanged",
+                             self, SLOT("onSignal(QDBusMessage)"))
+        self.refresh()
+
+    @staticmethod
+    def _call(bus, svc, path, iface, method, *args):
+        m = QDBusMessage.createMethodCall(svc, path, iface, method)
+        m.setArguments(list(args))
+        r = bus.call(m)
+        if r.type() != QDBusMessage.ReplyMessage or not r.arguments():
+            return None
+        return r.arguments()[0]
+
+    def _get(self, bus, svc, path, iface, prop):
+        v = self._call(bus, svc, path, "org.freedesktop.DBus.Properties", "Get", iface, prop)
+        return v.variant() if hasattr(v, "variant") else v
+
+    def _find_session(self):
+        # A systemd --user service is outside the graphical session, so ask
+        # logind for the session of this user's display.
+        sid = os.environ.get("XDG_SESSION_ID")
+        if not sid:
+            try:
+                sid = subprocess.run(["loginctl", "show-user", str(os.getuid()), "-p", "Display", "--value"],
+                                     capture_output=True, text=True, timeout=3).stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                sid = ""
+        if not sid:
+            return None
+        p = self._call(self.sys, "org.freedesktop.login1", "/org/freedesktop/login1",
+                       "org.freedesktop.login1.Manager", "GetSession", sid)
+        return p.path() if isinstance(p, QDBusObjectPath) else (p or None)
+
+    @Slot(QDBusMessage)
+    def onSignal(self, _msg):
+        self.refresh()
+
+    def refresh(self):
+        before = self.snapshot()
+        if self.has_ppd:
+            self.profile = self._get(self.sys, "net.hadess.PowerProfiles", "/net/hadess/PowerProfiles",
+                                     "net.hadess.PowerProfiles", "ActiveProfile")
+        else:
+            self.profile = self._call(self.ses, "org.kde.Solid.PowerManagement",
+                                      "/org/kde/Solid/PowerManagement/Actions/PowerProfile",
+                                      "org.kde.Solid.PowerManagement.Actions.PowerProfile", "currentProfile")
+        self.on_battery = bool(self._get(self.sys, "org.freedesktop.UPower", "/org/freedesktop/UPower",
+                                         "org.freedesktop.UPower", "OnBattery"))
+        present = self._get(self.sys, "org.freedesktop.UPower", "/org/freedesktop/UPower/devices/DisplayDevice",
+                            "org.freedesktop.UPower.Device", "IsPresent")
+        pct = self._get(self.sys, "org.freedesktop.UPower", "/org/freedesktop/UPower/devices/DisplayDevice",
+                        "org.freedesktop.UPower.Device", "Percentage")
+        self.percent = round(pct) if present and pct is not None else None
+        self.screensaver = bool(self._call(self.ses, "org.freedesktop.ScreenSaver", "/ScreenSaver",
+                                           "org.freedesktop.ScreenSaver", "GetActive"))
+        if self.session_path:
+            g = lambda p: self._get(self.sys, "org.freedesktop.login1", self.session_path,
+                                    "org.freedesktop.login1.Session", p)
+            self.locked = bool(g("LockedHint"))
+            self.idle = bool(g("IdleHint"))
+            active = g("Active")
+            self.session_active = True if active is None else bool(active)
+        if self.snapshot() != before:
+            self.changed.emit()
+
+    def snapshot(self):
+        return dict(profile=self.profile, on_battery=self.on_battery, percent=self.percent,
+                    screensaver=self.screensaver, locked=self.locked, idle=self.idle,
+                    session_active=self.session_active)
+
+
+SOURCE_NONE, SOURCE_AUDIO, SOURCE_SYSTEM = 0, 1, 2
+NBARS, NPIPES = 26, 4
+
+
+def pack(source, bars=(), pipes=()):
+    """[source, 26 bars, 4 pipes] as bytes, values 0..1 -> 0..255"""
+    q = lambda v: max(0, min(255, int(round(v * 255))))
+    bars = list(bars) + [0] * (NBARS - len(bars))
+    pipes = list(pipes) + [0] * (NPIPES - len(pipes))
+    return bytes([source] + [q(v) for v in bars[:NBARS]] + [q(v) for v in pipes[:NPIPES]])
+
+
+class Audio(QObject):
+    """Spectrum of what the speakers play: the default sink's monitor through
+    pw-record, analysed with numpy. Nothing is captured unless it is wanted
+    AND some stream is actually playing (pactl subscribe, event driven); in
+    silence the FFT is skipped and after 3 s the wallpaper gets SOURCE_NONE."""
+    levels = Signal(bytes)
+    RATE, N = 16000, 1024
+    SILENCE_DB, SILENCE_S = -55.0, 3.0
+
+    def __init__(self):
+        super().__init__()
+        self.want = False
+        self.fps = 15
+        self.sub = None          # pactl subscribe
+        self.rec = None          # pw-record
+        self.np = None
+        self.target = os.environ.get("DOTGRID_AUDIO_TARGET")   # tests: capture another node
+
+    fall, range_db, peak_fall = 0.09, 42.0, 0.03
+
+    def tune(self, fall, sensitivity, peak_fall):
+        """Bars fall speed, sensitivity (smaller dB range = more lit), peak fall."""
+        self.fall = 0.09 * fall
+        self.range_db = 42.0 / sensitivity
+        self.peak_fall = 0.03 * peak_fall
+
+    def set_wanted(self, want, fps):
+        self.fps = max(5, min(30, fps))
+        if want == self.want:
+            return
+        self.want = want
+        if want:
+            self._start_watch()
+        else:
+            self._stop_watch()
+            self._stop_capture()
+
+    # ---- is anything playing? ----
+    def _start_watch(self):
+        self.sub = QProcess(self)
+        self.sub.readyReadStandardOutput.connect(self._on_events)
+        self.sub.start("pactl", ["subscribe"])
+        self._check_playing()
+
+    def _stop_watch(self):
+        if self.sub:
+            self.sub.kill()
+            self.sub.waitForFinished(500)
+            self.sub = None
+
+    def _on_events(self):
+        data = bytes(self.sub.readAllStandardOutput()).decode(errors="replace")
+        if "sink-input" in data:
+            self._check_playing()
+
+    def _check_playing(self):
+        try:
+            out = subprocess.run(["pactl", "-f", "json", "list", "sink-inputs"],
+                                 capture_output=True, text=True, timeout=3).stdout
+            playing = any(not s.get("corked", False) for s in json.loads(out or "[]"))
+        except (OSError, subprocess.SubprocessError, ValueError):
+            playing = False
+        if playing and self.want:
+            self._start_capture()
+        else:
+            self._stop_capture()
+
+    # ---- capture + analysis ----
+    def _start_capture(self):
+        if self.rec:
+            return
+        if self.np is None:
+            import numpy
+            self.np = numpy
+            n = self.N
+            self.window = numpy.hanning(n).astype(numpy.float32)
+            freqs = numpy.fft.rfftfreq(n, 1 / self.RATE)
+            edges = numpy.geomspace(60, 7000, NBARS + 1)
+            # bin ranges per band, at least one bin each
+            self.bands = [(int(numpy.searchsorted(freqs, lo)), max(int(numpy.searchsorted(freqs, lo)) + 1,
+                                                                    int(numpy.searchsorted(freqs, hi))))
+                          for lo, hi in zip(edges[:-1], edges[1:])]
+        np = self.np
+        self.frames = np.zeros((self.N, 2), dtype=np.float32)
+        self.pending = bytearray()
+        self.smooth = np.zeros(NBARS, dtype=np.float32)
+        self.peaks = np.zeros(2, dtype=np.float32)
+        self.ref = -30.0
+        self.loud_at = time.monotonic()
+        self.silent = False
+        self.rec = QProcess(self)
+        # Qt buffers the pipe; Python looks at it on a timer (frame rate,
+        # 2 Hz in silence) instead of waking up for every small chunk
+        self.reader = QTimer(self)
+        self.reader.timeout.connect(self._on_audio)
+        self.reader.start(int(1000 / self.fps))
+        args = ["-P", "{ stream.capture.sink=true node.name=dotgrid-live-spectrum "
+                      "node.description=\"DotGrid Live spectrum\" }",
+                "--rate", str(self.RATE), "--channels", "2", "--format", "s16",
+                "--latency", "50ms", "--raw", "-"]
+        if self.target:
+            args[2:2] = ["--target", self.target]
+        self.rec.start("pw-record", args)
+        log("audio capture started")
+
+    def _stop_capture(self):
+        if self.rec:
+            self.reader.stop()
+            log("audio capture stopped")
+            self.rec.kill()
+            self.rec.waitForFinished(500)
+            self.rec = None
+            self.levels.emit(pack(SOURCE_NONE))
+
+    def _on_audio(self):
+        np = self.np
+        self.pending += bytes(self.rec.readAllStandardOutput())
+        whole = len(self.pending) // 4 * 4
+        if not whole:
+            return
+        chunk = np.frombuffer(bytes(self.pending[:whole]), dtype=np.int16).reshape(-1, 2)
+        del self.pending[:whole]
+        chunk = chunk[-self.N:].astype(np.float32) / 32768.0
+        self.frames = np.concatenate((self.frames[len(chunk):], chunk))
+        self._analyse(time.monotonic())
+        self.reader.setInterval(500 if self.silent else int(1000 / self.fps))
+
+    def _analyse(self, now):
+        np = self.np
+        rms = np.sqrt(np.mean(self.frames ** 2, axis=0)) + 1e-9
+        db = 20 * np.log10(rms)
+        if db.max() < self.SILENCE_DB:
+            if not self.silent and now - self.loud_at > self.SILENCE_S:
+                self.silent = True
+                log("audio: silence")
+                self.levels.emit(pack(SOURCE_NONE))
+            if self.silent:
+                return              # nothing to show, skip the FFT
+        else:
+            self.loud_at = now
+            if self.silent:
+                log("audio: sound")
+            self.silent = False
+        mono = self.frames.mean(axis=1) * self.window
+        mag = np.abs(np.fft.rfft(mono)) / (self.N / 4)          # ~1.0 for a full-scale sine
+        bdb = np.array([10 * np.log10(np.mean(mag[a:b] ** 2) + 1e-12) for a, b in self.bands])
+        # slow automatic gain: the loudest band sets the top of the scale
+        self.ref = max(self.ref - 0.15, float(bdb.max()), -45.0)
+        level = np.clip((bdb - (self.ref - self.range_db)) / self.range_db, 0.0, 1.0)
+        self.smooth = np.maximum(level, self.smooth - self.fall)  # fast attack, slow fall
+        vu = np.clip((db + 50.0) / 50.0, 0.0, 1.0)
+        self.peaks = np.maximum(vu, self.peaks - self.peak_fall)
+        self.levels.emit(pack(SOURCE_AUDIO, self.smooth, [vu[0], vu[1], self.peaks[0], self.peaks[1]]))
+
+
+class SystemStats(QObject):
+    """CPU history for the bars; CPU, RAM, network in/out for the pipes. 1 Hz,
+    only while wanted."""
+    levels = Signal(bytes)
+
+    def __init__(self):
+        super().__init__()
+        self.timer = QTimer(self)
+        self.timer.setInterval(1000)
+        self.timer.timeout.connect(self._tick)
+        self.history = deque([0.0] * NBARS, maxlen=NBARS)
+        self.prev_cpu = None
+        self.prev_net = None
+
+    def set_wanted(self, want):
+        if want == self.timer.isActive():
+            return
+        if want:
+            self.prev_cpu = self.prev_net = None
+            self._tick()
+            self.timer.start()
+        else:
+            self.timer.stop()
+            self.levels.emit(pack(SOURCE_NONE))
+
+    @staticmethod
+    def _iface():
+        try:
+            with open("/proc/net/route") as f:
+                for line in f.readlines()[1:]:
+                    p = line.split()
+                    if p[1] == "00000000":
+                        return p[0]
+        except OSError:
+            pass
+        return None
+
+    def _tick(self):
+        with open("/proc/stat") as f:
+            v = [int(x) for x in f.readline().split()[1:]]
+        idle, total = v[3] + v[4], sum(v)
+        cpu = 0.0
+        if self.prev_cpu:
+            dt = total - self.prev_cpu[1]
+            cpu = 1.0 - (idle - self.prev_cpu[0]) / dt if dt > 0 else 0.0
+        self.prev_cpu = (idle, total)
+        self.history.append(cpu)
+
+        mem = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, val = line.split(":")
+                mem[k] = int(val.split()[0])
+        ram = 1.0 - mem.get("MemAvailable", 0) / max(1, mem.get("MemTotal", 1))
+
+        rx = tx = 0.0
+        iface = self._iface()
+        if iface:
+            try:
+                base = f"/sys/class/net/{iface}/statistics/"
+                cur = (int(open(base + "rx_bytes").read()), int(open(base + "tx_bytes").read()), time.monotonic())
+                if self.prev_net:
+                    dt = max(1e-3, cur[2] - self.prev_net[2])
+                    # log scale: 1 KB/s .. 100 MB/s
+                    scale = lambda b: max(0.0, min(1.0, (math.log10(max(b, 1)) - 3) / 5))
+                    rx = scale((cur[0] - self.prev_net[0]) / dt)
+                    tx = scale((cur[1] - self.prev_net[1]) / dt)
+                self.prev_net = cur
+            except (OSError, ValueError):
+                pass
+        self.levels.emit(pack(SOURCE_SYSTEM, self.history, [cpu, ram, rx, tx]))
+
+
+def hourly_snapshot(rows, hour_ts):
+    """One compact record for the minute rows of one clock hour."""
+    if not rows:
+        return None
+    mean = lambda xs: round(sum(xs) / len(xs), 2) if xs else None
+    groups = {}
+    for r in rows:
+        if r["paused"]:
+            k = "paused:" + ("+".join((["manual"] if r["manual"] else []) + r["auto"]) or "?")
+        else:
+            k = f"{r['mode']}:{r['bars']}{'+audio' if r.get('audio_capture') else ''}:{r['fps']}"
+        groups.setdefault(k, []).append(r)
+    state = {}
+    for k, rs in groups.items():
+        ps_k = [r["plasmashell_cpu"] for r in rs if r.get("plasmashell_cpu") is not None]
+        w_k = [r["battery_w"] for r in rs if r.get("battery_status") == "Discharging" and r.get("battery_w")]
+        state[k] = {"min": len(rs), "ps_cpu": mean(ps_k), "ps_n": len(ps_k),
+                    "bat_w": mean(w_k), "bat_min": len(w_k)}
+    ps = [r["plasmashell_cpu"] for r in rows if r.get("plasmashell_cpu") is not None]
+    rss = [r for r in rows if r.get("plasmashell_rss_kb")]
+    disch = [r for r in rows if r.get("battery_status") == "Discharging" and r.get("battery_w")]
+    pct = [r["battery_pct"] for r in rows if r.get("battery_pct") is not None]
+    profiles = [r.get("profile") for r in rows if r.get("profile")]
+    return {
+        "hour": time.strftime("%Y-%m-%dT%H", time.localtime(hour_ts)),
+        "min": len(rows),
+        "state": state,
+        "audio_min": sum(1 for r in rows if r.get("audio_capture")),
+        "bars": max(set(r["bars"] for r in rows), key=[r["bars"] for r in rows].count),
+        "fps": max(set(r["fps"] for r in rows), key=[r["fps"] for r in rows].count),
+        "ps_cpu": mean(ps), "ps_cpu_max": max(ps) if ps else None,
+        "svc_cpu": mean([r["service_cpu"] for r in rows if r.get("service_cpu") is not None]),
+        "rec_cpu": mean([r["pw_record_cpu"] for r in rows if r.get("pw_record_cpu") is not None]),
+        "ps_rss_mb": [round(min(r["plasmashell_rss_kb"] for r in rss) / 1024),
+                      round(max(r["plasmashell_rss_kb"] for r in rss) / 1024),
+                      round(rss[-1]["plasmashell_rss_kb"] / 1024)] if rss else None,
+        "ps_pid": rss[-1].get("plasmashell_pid") if rss else None,
+        "bat_w": mean([r["battery_w"] for r in disch]), "bat_min": len(disch),
+        "bat_pct": [pct[0], pct[-1]] if pct else None,
+        "profile": max(set(profiles), key=profiles.count) if profiles else None,
+    }
+
+
+def _xz_lines(path):
+    """All lines of a (multi-stream) xz file."""
+    import lzma
+    try:
+        with lzma.open(path) as f:
+            return f.read().splitlines(keepends=True)
+    except (OSError, lzma.LZMAError):
+        return []
+
+
+def _plain_lines(path):
+    try:
+        with open(path, "rb") as f:
+            return f.readlines()
+    except OSError:
+        return []
+
+
+def _write_xz(path, lines):
+    import lzma
+    tmp = path + ".tmp"
+    with lzma.open(tmp, "wb", preset=9 | lzma.PRESET_EXTREME) as f:
+        f.write(b"".join(lines))
+    os.replace(tmp, path)
+
+
+def hourly_migrate():
+    """Older versions kept one xz file per month: fold them into ARCHIVE."""
+    try:
+        months = sorted(f for f in os.listdir(HOURLY_DIR) if f.endswith(".jsonl.xz") and f != os.path.basename(ARCHIVE))
+    except OSError:
+        return
+    if not months:
+        return
+    lines = []
+    for name in months:
+        lines += _xz_lines(os.path.join(HOURLY_DIR, name))
+    def hour(l):
+        try:
+            return json.loads(l)["hour"]
+        except (ValueError, KeyError):
+            return ""
+    _write_xz(ARCHIVE, sorted(_xz_lines(ARCHIVE) + lines, key=hour))
+    for name in months:
+        os.remove(os.path.join(HOURLY_DIR, name))
+    log(f"metrics: {len(months)} monthly files merged into {ARCHIVE}")
+
+
+def hourly_append(snaps):
+    """New hours go to TODAY (plain, at most a day). Finished days are
+    compressed together and appended to ARCHIVE as one more xz stream, so a
+    whole day compresses well and nothing old is ever rewritten."""
+    import lzma
+    os.makedirs(HOURLY_DIR, exist_ok=True)
+    with open(TODAY, "ab") as f:
+        for s in snaps:
+            f.write((json.dumps(s, ensure_ascii=False, separators=(",", ":")) + "\n").encode())
+    today = time.strftime("%Y-%m-%d")
+    lines = _plain_lines(TODAY)
+    done = [l for l in lines if json.loads(l)["hour"][:10] < today]
+    if done:
+        with lzma.open(ARCHIVE, "ab", preset=9 | lzma.PRESET_EXTREME) as f:
+            f.write(b"".join(done))
+        keep = [l for l in lines if json.loads(l)["hour"][:10] >= today]
+        tmp = TODAY + ".tmp"
+        with open(tmp, "wb") as f:
+            f.writelines(keep)
+        os.replace(tmp, TODAY)
+
+
+def hourly_cap(cap_bytes):
+    """The only size limit: ARCHIVE + TODAY. Over it, the oldest quarter of
+    the archived hours goes and the archive is rewritten as one stream."""
+    size = lambda: sum(os.path.getsize(p) for p in (ARCHIVE, TODAY) if os.path.exists(p))
+    while size() > cap_bytes:
+        lines = _xz_lines(ARCHIVE)
+        if len(lines) < 4:
+            break                     # nothing sensible left to drop
+        keep = lines[len(lines) // 4:]
+        _write_xz(ARCHIVE, keep)
+        log(f"metrics: archive over the limit, kept {len(keep)} of {len(lines)} hours")
+
+
+def hourly_last():
+    """The last archived hour ("YYYY-MM-DDTHH") or None."""
+    for lines in (_plain_lines(TODAY), _xz_lines(ARCHIVE)):
+        for l in reversed(lines):
+            try:
+                return json.loads(l)["hour"]
+            except (ValueError, KeyError):
+                continue
+    return None
+
+
+class Metrics(QObject):
+    """Background measurement, off by default: once a minute one JSON line
+    with the CPU/RAM of plasmashell, of this service and of pw-record, the
+    battery draw, and what the wallpaper was doing. `dotgrid-live metrics`
+    summarises it. Costs one wake-up per minute.
+    Minute rows live only until their hour is over: then they are folded
+    into one snapshot (TODAY, then once a day into the single ARCHIVE) and
+    dropped, so the minute file stays at about one hour. Only the archive
+    has a size limit (metrics_max_mb); the oldest hours go first."""
+    INTERVAL_S = 60
+
+    def __init__(self, svc):
+        super().__init__()
+        self.svc = svc
+        self.timer = QTimer(self)
+        self.timer.setInterval(self.INTERVAL_S * 1000)
+        self.timer.timeout.connect(self._sample)
+        self.prev = {}                # name -> (pid, ticks, monotonic)
+        self.tck = os.sysconf("SC_CLK_TCK")
+
+    def set_enabled(self, on):
+        if on == self.timer.isActive():
+            return
+        if on:
+            self.prev = {}
+            try:
+                hourly_migrate()
+            except OSError as e:
+                log(f"metrics: {e}")
+            self._sample()            # first sample only primes the deltas
+            self.timer.start()
+            log(f"metrics on -> {METRICS}")
+        else:
+            self.timer.stop()
+            log("metrics off")
+
+    @staticmethod
+    def _pid(comm):
+        for d in os.listdir("/proc"):
+            if d.isdigit():
+                try:
+                    with open(f"/proc/{d}/comm") as f:
+                        if f.read().strip() == comm:
+                            return int(d)
+                except OSError:
+                    pass
+        return None
+
+    @staticmethod
+    def _proc(pid):
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                v = f.read().rsplit(")", 1)[1].split()
+            ticks = int(v[11]) + int(v[12])
+            with open(f"/proc/{pid}/status") as f:
+                rss = next(int(l.split()[1]) for l in f if l.startswith("VmRSS:"))
+            return ticks, rss
+        except (OSError, StopIteration, ValueError, IndexError):
+            return None
+
+    def _cpu(self, name, pid, now):
+        """% of one core since the last sample (None on the first one)."""
+        if pid is None:
+            return None, None
+        r = self._proc(pid)
+        if r is None:
+            return None, None
+        ticks, rss = r
+        pct = None
+        p = self.prev.get(name)
+        if p and p[0] == pid and now > p[2]:
+            pct = round((ticks - p[1]) * 100.0 / self.tck / (now - p[2]), 2)
+        self.prev[name] = (pid, ticks, now)
+        return pct, rss
+
+    @staticmethod
+    def _battery():
+        for dev in sorted(os.listdir("/sys/class/power_supply")):
+            base = f"/sys/class/power_supply/{dev}/"
+            try:
+                if open(base + "type").read().strip() != "Battery":
+                    continue
+                status = open(base + "status").read().strip()
+                watts = None
+                if os.path.exists(base + "power_now"):
+                    watts = int(open(base + "power_now").read()) / 1e6
+                elif os.path.exists(base + "current_now"):
+                    watts = int(open(base + "current_now").read()) * int(open(base + "voltage_now").read()) / 1e12
+                return status, round(watts, 2) if watts is not None else None
+            except (OSError, ValueError):
+                continue
+        return None, None
+
+    def _sample(self):
+        now = time.monotonic()
+        st = self.svc.status()
+        ps_pid = self._pid("plasmashell")
+        ps_cpu, ps_rss = self._cpu("plasmashell", ps_pid, now)
+        me_cpu, me_rss = self._cpu("self", os.getpid(), now)
+        rec = self.svc.audio.rec
+        rec_pid = rec.processId() if rec and rec.processId() else None
+        rec_cpu, _ = self._cpu("pw-record", rec_pid, now)
+        bstatus, watts = self._battery()
+        row = {
+            "ts": int(time.time()),
+            "mode": st["effective_mode"] or "?",
+            "paused": st["effective_paused"],
+            "manual": st["paused"],
+            "auto": st["auto_reasons"],
+            "bars": st["bars"],
+            "audio_capture": rec_pid is not None,
+            "fps": st["fps"]["night" if st["effective_mode"] == "night" else "day"],
+            "off": [k for k, v in st["elements"].items() if not v],
+            "plasmashell_pid": ps_pid, "plasmashell_cpu": ps_cpu, "plasmashell_rss_kb": ps_rss,
+            "service_cpu": me_cpu, "service_rss_kb": me_rss,
+            "pw_record_cpu": rec_cpu,
+            "battery_status": bstatus, "battery_w": watts,
+            "battery_pct": st["sensors"]["percent"], "profile": st["sensors"]["profile"],
+        }
+        if ps_cpu is None and me_cpu is None:
+            return                     # priming sample
+        try:
+            os.makedirs(os.path.dirname(METRICS), exist_ok=True)
+            with open(METRICS, "a") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            self._rollup(int(st["metrics_max_mb"] * 1024 * 1024))
+        except OSError as e:
+            log(f"metrics: {e}")
+
+    def _rollup(self, cap):
+        """Once per clock hour: fold the finished hours into the archive and
+        keep only the current hour in the minute file."""
+        hour_now = time.strftime("%Y-%m-%dT%H")
+        if getattr(self, "rolled", None) == hour_now:
+            return
+        last = hourly_last()
+        rows = []
+        with open(METRICS) as f:
+            for line in f:
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    pass
+        by_hour = {}
+        for r in rows:
+            h = time.strftime("%Y-%m-%dT%H", time.localtime(r["ts"]))
+            if h < hour_now and (last is None or h > last):
+                by_hour.setdefault(h, []).append(r)
+        if by_hour:
+            hourly_append([hourly_snapshot(by_hour[h], by_hour[h][0]["ts"]) for h in sorted(by_hour)])
+            hourly_cap(cap)
+            hs = sorted(by_hour)
+            log(f"metrics: archived {len(hs)} h ({hs[0]}" + (f" .. {hs[-1]})" if len(hs) > 1 else ")"))
+        current = [r for r in rows if time.strftime("%Y-%m-%dT%H", time.localtime(r["ts"])) >= hour_now]
+        if len(current) < len(rows):
+            tmp = METRICS + ".tmp"
+            with open(tmp, "w") as f:
+                f.writelines(json.dumps(r, ensure_ascii=False) + "\n" for r in current)
+            os.replace(tmp, METRICS)
+        self.rolled = hour_now
+
+
+@ClassInfo({"D-Bus Interface": "org.dotgrid.Live"})
+class LiveService(QObject):
+    """Exported on the session bus; also the in-process API for tray and shortcut."""
+    Changed = Signal(str)
+    Levels = Signal(QByteArray)
+    stateChanged = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.cfg = load_config()
+        LANG[0] = self.cfg.get("language", "ru")
+        self.audio = Audio()
+        self.system = SystemStats()
+        self._last_levels = None
+        self.audio.levels.connect(self._levels)
+        self.system.levels.connect(self._levels)
+        self.metrics = Metrics(self)
+        self.sensors = Sensors()
+        self.sensors.changed.connect(self._emit)
+        self.theme = self._read_theme()
+        self.watch = QFileSystemWatcher()
+        self._rewatch()
+        self.watch.fileChanged.connect(self._on_file)
+        self.watch.directoryChanged.connect(self._on_file)
+        self._last_json = None
+
+    # ---- files ----
+    def _rewatch(self):
+        for p in [CONFIG, THEME_STATE, os.path.dirname(CONFIG), os.path.dirname(THEME_STATE)]:
+            if os.path.exists(p) and p not in self.watch.files() + self.watch.directories():
+                self.watch.addPath(p)
+
+    def _read_theme(self):
+        try:
+            with open(THEME_STATE) as f:
+                t = f.read().strip()
+            return t if t in ("day", "night") else None
+        except OSError:
+            return None
+
+    def _on_file(self, _path):
+        self._rewatch()
+        self.theme = self._read_theme()
+        cfg = load_config()
+        if cfg != self.cfg:       # edited by hand or by the CLI without the service
+            self.cfg = cfg
+        self._emit()
+
+    # ---- state ----
+    def auto_reasons(self):
+        a, s, out = self.cfg["autopause"], self.sensors, []
+        if a["powersaver"] and s.profile == "power-saver":
+            out.append("powersaver")
+        if a["battery"] and s.on_battery and s.percent is not None and s.percent < a["battery_threshold"]:
+            out.append("battery")
+        if a["locked"] and (s.screensaver or s.locked or s.idle or not s.session_active):
+            out.append("locked")
+        return out
+
+    def status(self):
+        reasons = self.auto_reasons()
+        mode = self.cfg["mode"]
+        st = copy.deepcopy(self.cfg)
+        st.update({
+            "daemon": True,
+            "version": VERSION,
+            "auto_paused": bool(reasons),
+            "auto_reasons": reasons,
+            "effective_paused": self.cfg["paused"] or bool(reasons),
+            "effective_mode": mode if mode != "auto" else self.theme,   # None: wallpaper decides
+            "sensors": self.sensors.snapshot(),
+        })
+        return st
+
+    def _emit(self):
+        LANG[0] = self.cfg.get("language", "ru")
+        st = self.status()
+        js = json.dumps(st, ensure_ascii=False)
+        if js != self._last_json:
+            self._last_json = js
+            self.Changed.emit(js)
+            self.stateChanged.emit()
+        reasons = (st["paused"], tuple(st["auto_reasons"]))
+        if reasons != getattr(self, "_last_reasons", None):
+            self._last_reasons = reasons
+            log(f"paused={st['paused']} auto={','.join(st['auto_reasons']) or '-'}")
+        self._update_sources(st)
+
+    def _update_sources(self, st):
+        # data is only gathered while the night bars/pipes can show it
+        visible = (not st["effective_paused"] and st["effective_mode"] != "day"
+                   and (st["elements"]["bars"] or st["elements"]["pipes"]))
+        o = st["opts"]
+        self.audio.tune(o["bars"]["fall"], o["bars"]["sensitivity"], o["pipes"]["peak_fall"])
+        self.audio.set_wanted(visible and st["bars"] == "audio", st["fps"]["night"])
+        self.system.set_wanted(visible and st["bars"] == "system")
+        self.metrics.set_enabled(st["metrics"])
+
+    def _levels(self, data):
+        if data != self._last_levels:
+            self._last_levels = data
+            self.Levels.emit(QByteArray(data))
+
+    def set_value(self, key, value):
+        parts, value = validate(key, value)
+        node = self.cfg
+        for p in parts[:-1]:
+            node = node[p]
+        if node[parts[-1]] == value:
+            return
+        node[parts[-1]] = value
+        save_config(self.cfg)
+        self._emit()
+
+    def shutdown(self):
+        self.audio.set_wanted(False, 15)
+        self.system.set_wanted(False)
+        self.metrics.set_enabled(False)
+
+    # ---- DBus API ----
+    @Slot(result=str)
+    def Status(self):
+        return json.dumps(self.status(), ensure_ascii=False)
+
+    @Slot()
+    def Pause(self):
+        self.set_value("paused", True)
+
+    @Slot()
+    def Resume(self):
+        self.set_value("paused", False)
+
+    @Slot()
+    def Toggle(self):
+        self.set_value("paused", not self.cfg["paused"])
+
+    @Slot(str, str, result=str)
+    def Set(self, key, value_json):
+        try:
+            self.set_value(key, json.loads(value_json))
+        except (ValueError, TypeError) as e:
+            return str(e)
+        return ""
+
+    @Slot(str, result=str)
+    def Theme(self, which):
+        """Whole theme (colours, icons, Konsole, kitty, lock screen) through the
+        DotGrid scripts; the wallpaper goes back to following it."""
+        tool = {"day": "dotgrid-theme", "night": "dotgrid-theme", "schedule": "dotgrid-auto"}.get(which)
+        if not tool:
+            return "theme: one of day, night, schedule"
+        path = shutil.which(tool) or os.path.expanduser(f"~/.local/bin/{tool}")
+        if not os.access(path, os.X_OK):
+            # no DotGrid theme installed: at least switch the wallpaper
+            self.set_value("mode", "auto" if which == "schedule" else which)
+            return f"{tool} not found, switched the wallpaper only"
+        self.set_value("mode", "auto")
+        args = [which] if tool == "dotgrid-theme" else ["--force"]
+        QProcess.startDetached(path, args)
+        log(f"theme {which} via {tool}")
+        return ""
+
+
+def make_icon(kind, color):
+    """running: 3x3 dot grid; paused: two bars; auto: two hollow bars."""
+    pm = QPixmap(44, 44)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    c = QColor(color)
+    if kind == "running":
+        p.setPen(Qt.NoPen)
+        p.setBrush(c)
+        for y in range(3):
+            for x in range(3):
+                p.drawEllipse(QPointF(8 + x * 14, 8 + y * 14), 4.5, 4.5)
+    else:
+        for x in (10, 26):
+            r = QRectF(x, 6, 8, 32)
+            if kind == "paused":
+                p.setPen(Qt.NoPen)
+                p.setBrush(c)
+            else:
+                pen = p.pen()
+                pen.setColor(c)
+                pen.setWidthF(3)
+                p.setPen(pen)
+                p.setBrush(Qt.NoBrush)
+                r.adjust(1.5, 1.5, -1.5, -1.5)
+            p.drawRect(r)
+    p.end()
+    return QIcon(pm)
+
+
+HELP_CSS = """
+body { color: %(ink)s; background: %(bg)s; }
+h1 { font-size: 15pt; margin: 0 0 4px 0; }
+h2 { font-size: 12pt; margin: 18px 0 6px 0; border-bottom: 1px solid %(dim)s; }
+h3 { font-size: 10.5pt; margin: 12px 0 2px 0; }
+td { padding: 3px 10px 3px 0; vertical-align: top; }
+.k { white-space: nowrap; font-weight: bold; }
+.d { color: %(dim)s; }
+code { background: %(code)s; }
+"""
+
+
+def element_name(e):
+    return {"galaxy": T("галактика", "galaxy"), "bars": T("кубики", "bars"), "pipes": T("трубы", "pipes"),
+            "markers": "J/M/I", "matrix": T("матрица букв", "letter matrix"), "life": T("«Жизнь»", "Life"),
+            "tiles": T("плитки", "tiles"), "battery": T("батарея", "battery")}[e]
+
+
+def help_html(st):
+    """The help text in the current language, with the current state on top."""
+    on = lambda e: T("вкл", "on") if st["elements"][e] else T("<b>выкл (застыл)</b>", "<b>off (frozen)</b>")
+    if st["paused"]:
+        state = T("пауза (вручную)", "paused (manually)")
+    elif st["auto_paused"]:
+        state = T("автопауза: ", "auto-paused: ") + ", ".join(rule_name(r) for r in st["auto_reasons"])
+    else:
+        state = T("идёт", "running")
+    eff = st["effective_mode"] or T("по цветовой схеме KDE", "from the KDE colour scheme")
+    mode = T("следуют за темой", "follows the theme") if st["mode"] == "auto" else \
+        T(f"<b>принудительно {st['mode']}</b>", f"<b>forced {st['mode']}</b>")
+    bars = {"audio": T("звук", "audio"), "generative": T("волны", "waves"), "system": T("система", "system")}[st["bars"]]
+    ap, o = st["autopause"], st["opts"]
+    rules = ", ".join(rule_name(k) for k in ("powersaver", "battery", "locked") if ap[k]) or T("все выключены", "all off")
+    off = [element_name(e) for e in ELEMENTS if not st["elements"][e]]
+    row = lambda k, d: f"<tr><td class='k'>{k}</td><td>{d}</td></tr>"
+    tiles = {"minute": T("секунды текущей минуты (плитка = 5 с)", "seconds of the current minute (tile = 5 s)"),
+             "hour": T("минуты текущего часа (плитка = 5 мин)", "minutes of the current hour (tile = 5 min)"),
+             "day": T("часы текущих суток (плитка = 2 ч)", "hours of the current day (tile = 2 h)")}[o["tiles"]["source"]]
+    return f"""
+<h1>DotGrid Live — {T("что есть что", "what is what")}</h1>
+<p class='d'>{T("Живые обои рабочего стола. Часы идут всегда; всё остальное на паузе замирает и не тратит процессор.",
+               "A living desktop wallpaper. The clocks always run; everything else freezes on pause and costs no CPU.")}</p>
+
+<h2>{T("Сейчас", "Now")}</h2>
+<table>
+{row(T("Состояние", "State"), state)}
+{row(T("Тема", "Theme"), f"{eff}; " + T("обои ", "wallpaper ") + mode)}
+{row(T("Кубики/трубы", "Bars/pipes"), bars + (T(" — сейчас идёт звук", " — audio is playing") if st.get("audio_capture") else ""))}
+{row("FPS", T(f"день {st['fps']['day']}, ночь {st['fps']['night']}", f"day {st['fps']['day']}, night {st['fps']['night']}"))}
+{row(T("Выключены", "Switched off"), ", ".join(off) if off else T("ничего", "nothing"))}
+{row(T("Автопауза", "Auto-pause"), rules + T(f"; порог батареи {ap['battery_threshold']}%", f"; battery threshold {ap['battery_threshold']}%"))}
+{row(T("Замер", "Metrics"), (T("пишется", "recording") if st["metrics"] else T("выключен", "off")) + T(f", архив до {st['metrics_max_mb']:g} МБ", f", archive up to {st['metrics_max_mb']:g} MB"))}
+</table>
+
+<h2>{T("Управление", "Controls")}</h2>
+<table>
+{row(T("Левый клик по иконке", "Left click on the icon"), T("пауза / продолжить", "pause / resume"))}
+{row(T("Средний клик", "Middle click"), T("окно настроек", "settings window"))}
+{row(T("Значок", "Icon"), T("сетка точек — идёт; две полоски — пауза вручную; две пустые полоски — автопауза (причина в подсказке)",
+                             "dot grid — running; two bars — paused manually; two hollow bars — auto-paused (reason in the tooltip)"))}
+{row(T("Тема", "Theme"), T("переключает <b>всю</b> тему DotGrid (цвета KDE, иконки, Konsole, kitty, экран блокировки); обои следуют за ней. «По расписанию» — день от восхода до заката (место — по часовому поясу или LAT/LON в <code>~/.config/dotgrid/schedule</code>; <code>dotgrid-auto --show</code> покажет время). Ручной выбор держится до следующего переключения по расписанию",
+                           "switches the <b>whole</b> DotGrid theme (KDE colours, icons, Konsole, kitty, lock screen); the wallpaper follows. “By schedule” means day from sunrise to sunset (the place comes from the time zone or LAT/LON in <code>~/.config/dotgrid/schedule</code>; <code>dotgrid-auto --show</code> prints the times). A manual choice lasts until the next scheduled switch"))}
+{row("FPS", T("ночью — частота всей ночной сцены и анализа звука; днём — только скорость перебора букв (у «Жизни» и плиток свой темп). Каждый кадр перерисовывает весь экран: каждые +15 кадров стоят около +5% одного ядра",
+              "at night — the frame rate of the whole night scene and of the audio analysis; by day — only the letter flicker (Life and the tiles keep their own pace). Every frame redraws the whole screen: each +15 fps costs about +5% of one core"))}
+{row(T("Элементы", "Elements"), T("каждый включается отдельно и настраивается в окне настроек; выключенный застывает в текущей позе",
+                                    "each one is switched on its own and tuned in the settings window; a switched-off element freezes in its current pose"))}
+{row(st.get("shortcut", "Meta+Shift+P"), T("пауза / продолжить (переназначается: Параметры → Комбинации клавиш → DotGrid Live)",
+                                             "pause / resume (rebind: System Settings → Shortcuts → DotGrid Live)"))}
+{row("dotgrid-live …", T("то же из терминала: <code>dotgrid-live</code> без аргументов покажет список команд",
+                         "the same from a terminal: <code>dotgrid-live</code> without arguments lists the commands"))}
+</table>
+
+<h2>{T("День: элементы и от чего зависят", "Day: elements and what drives them")}</h2>
+<table>
+{row(T("Часы HH:mm:ss", "Clock HH:mm:ss"), T("системное время, раз в секунду. Идут всегда", "system time, once a second. Always runs"))}
+{row("24556 DR 5", T("надпись-украшение", "decoration"))}
+{row(T("12 плиток", "12 tiles"), f"{tiles}. " + T("На паузе замирают", "Freeze on pause") + f" ({on('tiles')})")}
+{row(T("«Жизнь» (0 и i)", "Life (0 and i)"), T(f"игра «Жизнь» Конвея на точках сетки: <b>0</b> — живая клетка, <b>i</b> — только родившаяся, точка — мёртвая. Рождается при трёх соседях, живёт при двух-трёх. {st['life_rate']:g} поколений/с. <b>random</b> — случайное поле (плотность {o['life']['density']}%), засевается заново при вымирании или застое дольше {o['life']['stale']} шагов; <b>edges</b> — края вспыхивают, в центре пятна; <b>draw</b> — клик ставит клетку. Новое поле прокручивается на {o['life']['warmup']} поколений",
+                                                   f"Conway's Game of Life on the grid dots: <b>0</b> — a live cell, <b>i</b> — just born, a dot — dead. Born with three neighbours, survives with two or three. {st['life_rate']:g} generations/s. <b>random</b> — random field ({o['life']['density']}% dense), reseeded when it dies out or stalls for more than {o['life']['stale']} steps; <b>edges</b> — the border sparks, blobs appear inside; <b>draw</b> — a click places a cell. A new field is run {o['life']['warmup']} generations ahead") + f" ({on('life')})")}
+{row(T("Матрица 9×9", "Matrix 9×9"), T(f"случайные буквы: раз в {o['matrix']['interval']:g} с одна ячейка перебирает {o['matrix']['flicker']} букв и останавливается" + (f", каждый {o['matrix']['column_every']}-й раз фиксируется целая колонка" if o['matrix']['column_every'] else ""),
+                                          f"random letters: every {o['matrix']['interval']:g} s one cell flicks through {o['matrix']['flicker']} letters and settles" + (f", every {o['matrix']['column_every']}th time a whole column locks in" if o['matrix']['column_every'] else "")) + f" ({on('matrix')})")}
+{row(T("Большие цифры", "Big digits"), T("заряд батареи из <code>/sys/class/power_supply</code>, раз в минуту; <b>FL</b> — 100%, <b>--</b> — нет батареи",
+                                         "battery charge from <code>/sys/class/power_supply</code>, once a minute; <b>FL</b> — 100%, <b>--</b> — no battery") + f" ({on('battery')})")}
+</table>
+
+<h2>{T("Ночь: элементы и от чего зависят", "Night: elements and what drives them")}</h2>
+<table>
+{row("ENVIRON CTR | DR-5 |", T("заголовок-украшение", "decoration"))}
+{row(T("Трубы ||||", "Pipes ||||"), T("4 строки по 15, светлые — уровень. <b>Звук</b>: левый, правый, пик левого, пик правого. <b>Система</b>: CPU, RAM, сеть вход, сеть выход. <b>Волны</b>: без датчиков",
+                                       "4 rows of 15, lit ones show the level. <b>Audio</b>: left, right, left peak, right peak. <b>System</b>: CPU, RAM, network in, network out. <b>Waves</b>: no sensors") + f" ({on('pipes')})")}
+{row(T("Кубики 26×12", "Bars 26×12"), T("<b>Звук</b>: спектр того, что играет в колонки, 26 полос 60 Гц … 7 кГц; захват только пока что-то играет, после 3 с тишины — плавно в волны. <b>Система</b>: история CPU за 26 с. <b>Волны</b>: «дышащая» анимация",
+                                          "<b>Audio</b>: spectrum of what the speakers play, 26 bands 60 Hz … 7 kHz; captured only while something plays, after 3 s of silence — fades to waves. <b>System</b>: CPU history of the last 26 s. <b>Waves</b>: a breathing animation") + f" ({on('bars')})")}
+{row("J / M / I", T("часы на точечных строках: J — час суток, M — минута, I — секунда. Идут и на паузе",
+                    "a clock on the dot rows: J — hour of the day, M — minute, I — second. Run on pause too") + f" ({on('markers')})")}
+{row("unix | HH:mm:ss", T("время Unix и местное время, раз в секунду. Идут всегда", "Unix time and local time, once a second. Always run"))}
+{row(T("Галактика", "Galaxy"), T(f"{o['galaxy']['stars']} звёзд-квадратов; центр вращается быстрее края; оборот края {st['galaxy_turn_minutes']:g} мин; обновление {o['galaxy']['hz']} раз/с",
+                                 f"{o['galaxy']['stars']} square stars; the centre turns faster than the edge; one turn of the edge {st['galaxy_turn_minutes']:g} min; {o['galaxy']['hz']} updates/s") + f" ({on('galaxy')})")}
+</table>
+
+<h2>{T("Пауза и автопауза", "Pause and auto-pause")}</h2>
+<p>{T("На паузе стоят все анимации, идут только часы и J/M/I. Ручная пауза и автопауза независимы: автопауза снимается сама, ручная — только тобой. Правила: профиль «энергосбережение»; от батареи и заряд ниже порога; экран заблокирован или сеанс простаивает.",
+      "On pause all animations stop; only the clocks and J/M/I keep going. Manual pause and auto-pause are independent: auto-pause lifts by itself, a manual one only by you. Rules: power-saver profile; on battery below the threshold; screen locked or session idle.")}</p>
+
+<h2>{T("Энергия", "Power")}</h2>
+<p>{T("Самое дорогое — сами кадры: каждый перерисовывает весь экран. Экономнее всего: FPS 15, меньше звёзд и обновлений галактики, пауза, когда обоев не видно. Звук — около 3% ядра, пока что-то играет.",
+      "Frames are what costs: each one redraws the whole screen. Cheapest: 15 fps, fewer stars and galaxy updates, pause when the wallpaper is hidden. Audio costs about 3% of a core while something plays.")}</p>
+
+<h2>{T("Замер", "Metrics")}</h2>
+<p>{T("Раз в минуту — нагрузка plasmashell и сервиса, память и разряд батареи вместе с тем, что делали обои; каждый час минуты сворачиваются в сжатый снимок (<code>~/.local/state/dotgrid-live/hourly/</code>, меньше 1 КБ в сутки); лимит только на архив.",
+      "Once a minute — plasmashell and service load, memory and battery draw along with what the wallpaper was doing; every hour the minutes are folded into a compressed snapshot (<code>~/.local/state/dotgrid-live/hourly/</code>, under 1 KB a day); only the archive has a size limit.")}</p>
+
+<h2>{T("Файлы", "Files")}</h2>
+<table>
+{row("~/.config/dotgrid/live.json", T("настройки", "settings"))}
+{row("~/.local/share/plasma/wallpapers/org.dotgrid.live/", T("обои", "the wallpaper"))}
+{row("journalctl --user -u dotgrid-livectl", T("журнал сервиса", "service log"))}
+{row("uninstall-live.sh", T("убрать живые обои", "remove the live wallpaper"))}
+</table>
+"""
+
+
+class HelpWindow(QDialog):
+    """Opened from the tray; built on demand and destroyed on close."""
+
+    def __init__(self, svc):
+        super().__init__()
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setWindowTitle(T("DotGrid Live — справка", "DotGrid Live — help"))
+        self.resize(900, 900)
+        night = (svc.status()["effective_mode"] or svc.theme) == "night"
+        colors = (dict(ink="#e8e0d0", bg="#0a0a0a", dim="#8a877e", code="#1c1c1a") if night else
+                  dict(ink="#161614", bg="#d6cdbc", dim="#6e685c", code="#c8bfac"))
+        self.setStyleSheet(f"QDialog {{ background: {colors['bg']}; }}")
+        view = QTextBrowser(self)
+        view.setOpenExternalLinks(True)
+        view.setFont(QFont("JetBrains Mono", 10))
+        view.setStyleSheet(f"QTextBrowser {{ background: {colors['bg']}; color: {colors['ink']}; border: none; }}")
+        view.document().setDefaultStyleSheet(HELP_CSS % colors)
+        st = svc.status()
+        st["audio_capture"] = svc.audio.rec is not None
+        view.setHtml(help_html(st))
+        buttons = QDialogButtonBox(QDialogButtonBox.Close, self)
+        buttons.rejected.connect(self.close)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 18, 18, 12)
+        lay.addWidget(view)
+        lay.addWidget(buttons)
+
+
+def cfg_get(cfg, path):
+    node = cfg
+    for p in path.split("."):
+        node = node[p]
+    return node
+
+
+class SettingsWindow(QDialog):
+    """Every setting in one window, on three tabs. Changes apply at once; the
+    window follows changes made from the tray or the CLI. Built on demand,
+    freed on close; reopens itself when the language changes."""
+
+    def __init__(self, svc, tray):
+        super().__init__()
+        self.svc, self.tray = svc, tray
+        self.lang = LANG[0]
+        self.binds = []              # (path, apply-to-widget function)
+        self._building = True
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setWindowTitle(T("DotGrid Live — настройки", "DotGrid Live — settings"))
+        self.resize(820, 760)
+
+        tabs = QTabWidget()
+        tabs.addTab(self._scroll(self._general()), T("Общее", "General"))
+        tabs.addTab(self._scroll(self._night()), T("Ночь", "Night"))
+        tabs.addTab(self._scroll(self._day()), T("День", "Day"))
+
+        bottom = QHBoxLayout()
+        self.key_label = QLabel()
+        bottom.addWidget(self.key_label)
+        b = QPushButton(T("Изменить…", "Change…"))
+        b.setToolTip(T("Параметры → Комбинации клавиш → DotGrid Live", "System Settings → Shortcuts → DotGrid Live"))
+        b.clicked.connect(lambda: QProcess.startDetached("kcmshell6", ["kcm_keys"]))
+        bottom.addWidget(b)
+        bottom.addStretch(1)
+        for label, slot in ((T("Справка", "Help"), tray.show_help),
+                            (T("Открыть live.json", "Open live.json"), lambda: QProcess.startDetached("xdg-open", [CONFIG])),
+                            (T("Закрыть", "Close"), self.close)):
+            b = QPushButton(label)
+            b.clicked.connect(slot)
+            bottom.addWidget(b)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(tabs, 1)
+        lay.addLayout(bottom)
+        svc.stateChanged.connect(self.refresh)
+        self.refresh()
+        self._building = False
+
+    # ---- building blocks ----
+    @staticmethod
+    def _scroll(widget):
+        s = QScrollArea()
+        s.setWidgetResizable(True)
+        s.setFrameShape(QScrollArea.NoFrame)
+        s.setWidget(widget)
+        return s
+
+    @staticmethod
+    def _hint(text):
+        h = QLabel(text)
+        h.setWordWrap(True)
+        h.setEnabled(False)          # greyed: an explanation, not a control
+        return h
+
+    def _set(self, key, value):
+        if not self._building:
+            self.svc.set_value(key, value)
+
+    def _form(self, box):
+        f = QFormLayout()
+        f.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        box.layout().addLayout(f)
+        return f
+
+    def _dspin(self, form, label, path, lo, hi, step, decimals=1, suffix=""):
+        w = QDoubleSpinBox()
+        w.setRange(lo, hi)
+        w.setSingleStep(step)
+        w.setDecimals(decimals)
+        w.setSuffix(suffix)
+        w.valueChanged.connect(lambda v: self._set(path, round(v, decimals)))
+        self.binds.append((path, w.setValue))
+        form.addRow(label, w)
+        return w
+
+    def _ispin(self, form, label, path, lo, hi, suffix="", special=None):
+        w = QSpinBox()
+        w.setRange(lo, hi)
+        w.setSuffix(suffix)
+        if special:
+            w.setSpecialValueText(special)
+        w.valueChanged.connect(lambda v: self._set(path, v))
+        self.binds.append((path, w.setValue))
+        form.addRow(label, w)
+        return w
+
+    def _combo(self, form, label, path, items):
+        w = QComboBox()
+        for value, text in items:
+            w.addItem(text, value)
+        w.currentIndexChanged.connect(lambda _: self._set(path, w.currentData()))
+        self.binds.append((path, lambda v: w.setCurrentIndex(w.findData(v))))
+        if form is not None:
+            form.addRow(label, w)
+        return w
+
+    def _check(self, layout, label, path):
+        w = QCheckBox(label)
+        w.toggled.connect(lambda on: self._set(path, on))
+        self.binds.append((path, w.setChecked))
+        layout.addWidget(w)
+        return w
+
+    def _element(self, e, title, hint):
+        """A group whose own checkbox switches the element on and off."""
+        g = QGroupBox(f"{element_name(e)} — {title}")
+        g.setCheckable(True)
+        g.toggled.connect(lambda on: self._set(f"elements.{e}", on))
+        self.binds.append((f"elements.{e}", g.setChecked))
+        v = QVBoxLayout(g)
+        v.addWidget(self._hint(hint))
+        return g
+
+    # ---- tabs ----
+    def _general(self):
+        page = QWidget()
+        col = QVBoxLayout(page)
+
+        g = QGroupBox(T("Тема", "Theme"))
+        v = QVBoxLayout(g)
+        row = QHBoxLayout()
+        for label, which in ((T("День", "Day"), "day"), (T("Ночь", "Night"), "night"),
+                             (T("По расписанию", "By schedule"), "schedule")):
+            b = QPushButton(label)
+            b.clicked.connect(lambda _=False, w=which: self.svc.Theme(w))
+            row.addWidget(b)
+        v.addLayout(row)
+        self.theme_label = QLabel()
+        v.addWidget(self.theme_label)
+        v.addWidget(self._hint(T("Меняет всю тему DotGrid: цвета KDE, иконки, Konsole, kitty, экран блокировки. Ручной выбор держится до следующего переключения по расписанию.",
+                                 "Switches the whole DotGrid theme: KDE colours, icons, Konsole, kitty, lock screen. A manual choice lasts until the next scheduled switch.")))
+        f = self._form(g)
+        self._combo(f, T("Обои:", "Wallpaper:"), "mode", [("auto", T("за темой", "follow the theme")),
+                                                         ("day", T("всегда день", "always day")),
+                                                         ("night", T("всегда ночь", "always night"))])
+        col.addWidget(g)
+
+        g = QGroupBox(T("Анимация", "Animation"))
+        v = QVBoxLayout(g)
+        self.pause = QPushButton()
+        self.pause.clicked.connect(self.svc.Toggle)
+        v.addWidget(self.pause)
+        self.state_label = QLabel()
+        self.state_label.setWordWrap(True)
+        v.addWidget(self.state_label)
+        f = self._form(g)
+        fps = [(x, str(x)) for x in CHOICES["fps"]]
+        self._combo(f, T("FPS ночью:", "FPS at night:"), "fps.night", fps)
+        self._combo(f, T("FPS днём:", "FPS by day:"), "fps.day", fps)
+        v.addWidget(self._hint(T("Ночью — частота всей сцены и анализа звука. Днём — только скорость перебора букв: «Жизнь» и плитки идут своим темпом. Каждые +15 кадров стоят около +5% одного ядра.",
+                                 "At night — the rate of the whole scene and of the audio analysis. By day — only the letter flicker: Life and the tiles keep their own pace. Each +15 fps costs about +5% of one core.")))
+        f = self._form(g)
+        self._combo(f, T("Кубики и трубы:", "Bars and pipes:"), "bars",
+                    [("audio", T("звук (что играет в колонки)", "audio (what the speakers play)")),
+                     ("generative", T("волны (без датчиков)", "waves (no sensors)")),
+                     ("system", T("система (CPU, RAM, сеть)", "system (CPU, RAM, network)"))])
+        col.addWidget(g)
+
+        g = QGroupBox(T("Автопауза", "Auto-pause"))
+        v = QVBoxLayout(g)
+        self._check(v, T("профиль «энергосбережение»", "power-saver profile"), "autopause.powersaver")
+        self._check(v, T("экран заблокирован или сеанс простаивает", "screen locked or session idle"), "autopause.locked")
+        self._check(v, T("от батареи и заряд ниже порога", "on battery below the threshold"), "autopause.battery")
+        f = self._form(g)
+        self._ispin(f, T("Порог батареи:", "Battery threshold:"), "autopause.battery_threshold", 1, 100, " %")
+        v.addWidget(self._hint(T("Ручную паузу автопауза не снимает и не ставит.", "Auto-pause never sets or clears a manual pause.")))
+        col.addWidget(g)
+
+        g = QGroupBox(T("Замер нагрузки", "Load metrics"))
+        v = QVBoxLayout(g)
+        self._check(v, T("записывать раз в минуту", "record once a minute"), "metrics")
+        f = self._form(g)
+        self._dspin(f, T("Лимит архива:", "Archive limit:"), "metrics_max_mb", 0.1, 100, 0.5, 1, T(" МБ", " MB"))
+        v.addWidget(self._hint(T("Часовые снимки в сжатом архиве, меньше 1 КБ в сутки.", "Hourly snapshots in a compressed archive, under 1 KB a day.")))
+        b = QPushButton(T("Сводка…", "Summary…"))
+        b.clicked.connect(self._summary)
+        v.addWidget(b)
+        col.addWidget(g)
+
+        g = QGroupBox(T("Язык / Language", "Language / Язык"))
+        f = QFormLayout(g)
+        self._combo(f, "", "language", [("ru", "Русский"), ("en", "English")])
+        col.addWidget(g)
+        col.addStretch(1)
+        return page
+
+    def _night(self):
+        page = QWidget()
+        col = QVBoxLayout(page)
+
+        g = self._element("galaxy", T("вращение и мерцание", "rotation and twinkle"),
+                          T("Звёзды-квадраты на сплющенном диске; центр вращается быстрее края. Дороже всего здесь частота обновления и число звёзд.",
+                            "Square stars on a flattened disc; the centre turns faster than the edge. Update rate and star count are what costs here."))
+        f = self._form(g)
+        self.turn_label = QLabel()
+        self.turn = QSlider(Qt.Horizontal)
+        self.turn.setRange(1, 30)
+        self.turn.valueChanged.connect(self._turn_changed)
+        self.binds.append(("galaxy_turn_minutes", lambda v: self.turn.setValue(max(1, min(30, int(round(v)))))))
+        f.addRow(self.turn_label, self.turn)
+        self._ispin(f, T("Звёзд:", "Stars:"), "opts.galaxy.stars", 500, 4000)
+        self._ispin(f, T("Обновлений в секунду:", "Updates per second:"), "opts.galaxy.hz", 2, 30)
+        v = g.layout()
+        self._check(v, T("мерцание части звёзд", "some stars twinkle"), "opts.galaxy.twinkle")
+        self._check(v, T("ядро медленно «дышит»", "the core slowly breathes"), "opts.galaxy.pulse")
+        col.addWidget(g)
+
+        g = self._element("bars", T("26 столбиков", "26 columns"),
+                          T("Источник — на вкладке «Общее»: звук, волны или система.", "The source is on the General tab: audio, waves or system."))
+        f = self._form(g)
+        self._dspin(f, T("Скорость волн:", "Wave speed:"), "opts.bars.speed", 0.1, 4, 0.1, 1, "×")
+        self._dspin(f, T("Спад после звука:", "Fall after a beat:"), "opts.bars.fall", 0.2, 4, 0.1, 1, "×")
+        self._dspin(f, T("Чувствительность к звуку:", "Audio sensitivity:"), "opts.bars.sensitivity", 0.3, 3, 0.1, 1, "×")
+        col.addWidget(g)
+
+        g = self._element("pipes", T("4 строки индикаторов", "4 indicator rows"),
+                          T("Звук: левый, правый, их пики. Система: CPU, RAM, сеть вход/выход.", "Audio: left, right and their peaks. System: CPU, RAM, network in/out."))
+        f = self._form(g)
+        self._dspin(f, T("Скорость волн:", "Wave speed:"), "opts.pipes.speed", 0.1, 4, 0.1, 1, "×")
+        self._dspin(f, T("Спад пиков:", "Peak fall:"), "opts.pipes.peak_fall", 0.2, 4, 0.1, 1, "×")
+        col.addWidget(g)
+
+        g = self._element("markers", T("часы на точках", "clock on the dots"),
+                          T("J — час суток, M — минута, I — секунда. Идут и на паузе; выключенные застывают.",
+                            "J — hour of the day, M — minute, I — second. Run on pause too; when off they freeze."))
+        col.addWidget(g)
+        col.addStretch(1)
+        return page
+
+    def _day(self):
+        page = QWidget()
+        col = QVBoxLayout(page)
+
+        g = self._element("life", T("игра «Жизнь»", "Game of Life"),
+                          T("0 — живая клетка, i — только родившаяся, точка — мёртвая.", "0 — a live cell, i — just born, a dot — dead."))
+        f = self._form(g)
+        self._combo(f, T("Режим:", "Mode:"), "life_mode", [("random", T("случайное поле", "random field")),
+                                                         ("edges", T("края + пятна в центре", "sparking edges + blobs")),
+                                                         ("draw", T("рисование кликом", "draw with clicks"))])
+        self._dspin(f, T("Поколений в секунду:", "Generations per second:"), "life_rate", 0.2, 20, 0.5, 1)
+        self._ispin(f, T("Плотность засева:", "Seed density:"), "opts.life.density", 2, 60, " %")
+        self._ispin(f, T("Прокрутка нового поля:", "Run a new field ahead:"), "opts.life.warmup", 0, 100,
+                    T(" покол.", " gen."))
+        self._ispin(f, T("Новое поле после застоя:", "Reseed after stalling:"), "opts.life.stale", 5, 500,
+                    T(" шагов", " steps"))
+        col.addWidget(g)
+
+        g = self._element("matrix", T("перебор букв", "letter flicker"),
+                          T("Ячейка перебирает буквы и останавливается на новой; иногда фиксируется целая колонка.",
+                            "A cell flicks through letters and settles on a new one; now and then a whole column locks in."))
+        f = self._form(g)
+        self._dspin(f, T("Перебор каждые:", "Flicker every:"), "opts.matrix.interval", 0.3, 30, 0.1, 1, T(" с", " s"))
+        self._ispin(f, T("Длина перебора:", "Flicker length:"), "opts.matrix.flicker", 1, 30, T(" букв", " letters"))
+        self._ispin(f, T("Колонка каждый:", "Column every:"), "opts.matrix.column_every", 0, 200,
+                    T("-й раз", "th time"), special=T("никогда", "never"))
+        col.addWidget(g)
+
+        g = self._element("tiles", T("12 плиток", "12 tiles"), T("Заполняются слева направо.", "Fill from left to right."))
+        f = self._form(g)
+        self._combo(f, T("Показывают:", "Show:"), "opts.tiles.source",
+                    [("minute", T("секунды минуты (плитка = 5 с)", "seconds of the minute (tile = 5 s)")),
+                     ("hour", T("минуты часа (плитка = 5 мин)", "minutes of the hour (tile = 5 min)")),
+                     ("day", T("часы суток (плитка = 2 ч)", "hours of the day (tile = 2 h)"))])
+        col.addWidget(g)
+
+        g = self._element("battery", T("большие цифры", "big digits"),
+                          T("Заряд батареи раз в минуту: FL — 100%, -- — нет батареи.", "Battery charge once a minute: FL — 100%, -- — no battery."))
+        col.addWidget(g)
+        col.addStretch(1)
+        return page
+
+    # ---- actions ----
+    def _turn_changed(self, val):
+        self.turn_label.setText(T(f"Оборот: {val} мин", f"One turn: {val} min"))
+        self._set("galaxy_turn_minutes", float(val))
+
+    def _summary(self):
+        cli = os.path.join(os.path.dirname(os.path.realpath(__file__)), "dotgrid-live")
+        try:
+            text = subprocess.run([cli, "metrics"], capture_output=True, text=True, timeout=20).stdout
+            text += "\n" + subprocess.run([cli, "metrics", "hourly", "1"], capture_output=True, text=True,
+                                          timeout=20).stdout
+        except (OSError, subprocess.SubprocessError) as e:
+            text = str(e)
+        d = QDialog(self)
+        d.setAttribute(Qt.WA_DeleteOnClose)
+        d.setWindowTitle(T("DotGrid Live — замер", "DotGrid Live — metrics"))
+        d.resize(1100, 520)
+        view = QTextBrowser(d)
+        view.setFont(QFont("JetBrains Mono", 9))
+        view.setLineWrapMode(QTextBrowser.NoWrap)
+        view.setPlainText(text)
+        bb = QDialogButtonBox(QDialogButtonBox.Close, d)
+        bb.rejected.connect(d.close)
+        lay = QVBoxLayout(d)
+        lay.addWidget(view)
+        lay.addWidget(bb)
+        d.show()
+
+    def refresh(self):
+        """Puts the current state into the widgets without echoing it back."""
+        try:
+            self.isVisible()
+        except RuntimeError:         # closed and deleted; the signal may still fire once
+            return
+        if LANG[0] != self.lang:     # language changed: rebuild in the new one
+            self.close()
+            QTimer.singleShot(0, self.tray.show_settings)
+            return
+        st, cfg = self.svc.status(), self.svc.cfg
+        was = self._building
+        self._building = True
+        try:
+            for path, apply in self.binds:
+                apply(cfg_get(cfg, path))
+            theme = {"day": T("день", "day"), "night": T("ночь", "night")}.get(self.svc.theme, "?")
+            self.theme_label.setText(T("Сейчас тема: ", "Current theme: ") + f"<b>{theme}</b>")
+            self.pause.setText(T("Продолжить", "Resume") if cfg["paused"] else T("Пауза", "Pause"))
+            if cfg["paused"]:
+                state = T("Пауза вручную.", "Paused manually.")
+            elif st["auto_paused"]:
+                state = T("Автопауза: ", "Auto-paused: ") + ", ".join(rule_name(r) for r in st["auto_reasons"]) + "."
+            else:
+                state = T("Анимация идёт. Часы идут всегда.", "Animation running. The clocks always run.")
+            self.state_label.setText(state)
+            self.turn_label.setText(T(f"Оборот: {cfg['galaxy_turn_minutes']:g} мин", f"One turn: {cfg['galaxy_turn_minutes']:g} min"))
+            self.key_label.setText(T("Пауза с клавиатуры: ", "Pause key: ") + f"<b>{cfg['shortcut']}</b>")
+        finally:
+            self._building = was
+
+
+class Tray(QObject):
+    """Tray icon and menu. The menu is built once and its actions are never
+    deleted: the panel (plasmashell) shows it over DBus, and rebuilding it
+    while it is open left plasmashell pointing at a deleted action (crash in
+    QMenu::timerEvent). Changes only update text, checks and visibility."""
+
+    def __init__(self, svc, app):
+        super().__init__()
+        self.svc, self.app = svc, app
+        self.tray = QSystemTrayIcon()
+        self.menu = QMenu()
+        self.items = []          # (action, text(), checked() or None, visible() or None)
+        self._build()
+        self.tray.setContextMenu(self.menu)
+        self.tray.activated.connect(self._activated)
+        svc.stateChanged.connect(self.update)
+        self.update()
+        self.tray.show()
+
+    # ---- windows ----
+    def _reopen(self, attr, factory):
+        w = getattr(self, attr, None)
+        try:
+            if w is not None and w.isVisible():
+                w.raise_()
+                w.activateWindow()
+                return
+        except RuntimeError:          # already deleted on close
+            pass
+        w = factory()
+        setattr(self, attr, w)
+        w.show()
+
+    def show_settings(self):
+        self._reopen("settings", lambda: SettingsWindow(self.svc, self))
+
+    def show_help(self):
+        self._reopen("help", lambda: HelpWindow(self.svc))
+
+    def _activated(self, reason):
+        if reason == QSystemTrayIcon.Trigger:
+            self.svc.Toggle()
+        elif reason == QSystemTrayIcon.MiddleClick:
+            self.show_settings()
+
+    # ---- menu, built once ----
+    def _act(self, menu, text, slot, checked=None, visible=None, group=None):
+        a = menu.addAction(text())
+        if checked is not None:
+            a.setCheckable(True)
+            if group is not None:
+                group.addAction(a)
+        a.triggered.connect(slot)
+        self.items.append((a, text, checked, visible))
+        return a
+
+    def _sub(self, menu, text):
+        sub = menu.addMenu(text())
+        self.items.append((sub.menuAction(), text, None, None))
+        return sub
+
+    def _radio(self, menu, text, key, items):
+        sub = self._sub(menu, text)
+        grp = QActionGroup(sub)
+        for value, label in items:
+            self._act(sub, label, lambda _=False, v=value: self.svc.set_value(key, v),
+                      checked=lambda v=value: cfg_get(self.svc.cfg, key) == v, group=grp)
+
+    def _toggle(self, menu, text, key):
+        self._act(menu, text, lambda on, k=key: self.svc.set_value(k, on),
+                  checked=lambda: cfg_get(self.svc.cfg, key))
+
+    def _build(self):
+        m, cfg = self.menu, lambda: self.svc.cfg
+        self._act(m, lambda: T("Продолжить", "Resume") if cfg()["paused"] else T("Пауза", "Pause"), self.svc.Toggle)
+        self._act(m, lambda: T("Настройки…", "Settings…"), self.show_settings)
+        m.addSeparator()
+
+        th = self._sub(m, lambda: T("Тема", "Theme"))
+        grp = QActionGroup(th)
+        for value, label in (("day", lambda: T("день", "day")), ("night", lambda: T("ночь", "night"))):
+            self._act(th, label, lambda _=False, v=value: self.svc.Theme(v),
+                      checked=lambda v=value: self.svc.theme == v and cfg()["mode"] == "auto", group=grp)
+        th.addSeparator()
+        self._act(th, lambda: T("по расписанию сейчас", "by schedule now"), lambda: self.svc.Theme("schedule"))
+        forced = lambda: T("день", "day") if cfg()["mode"] == "day" else T("ночь", "night")
+        self._act(th, lambda: T(f"обои принудительно: {forced()} — вернуть за темой",
+                                f"wallpaper forced: {forced()} — follow the theme"),
+                  lambda: self.svc.set_value("mode", "auto"), visible=lambda: cfg()["mode"] != "auto")
+
+        self._radio(m, lambda: T("Кубики и трубы", "Bars and pipes"), "bars",
+                    [("audio", lambda: T("звук", "audio")), ("generative", lambda: T("волны", "waves")),
+                     ("system", lambda: T("система", "system"))])
+        fps = self._sub(m, lambda: "FPS")
+        for key, label in (("night", lambda: T("ночью", "at night")), ("day", lambda: T("днём", "by day"))):
+            self._radio(fps, label, f"fps.{key}", [(f, lambda f=f: str(f)) for f in CHOICES["fps"]])
+        el = self._sub(m, lambda: T("Элементы", "Elements"))
+        for e in ELEMENTS:
+            self._toggle(el, lambda e=e: element_name(e), f"elements.{e}")
+        self._radio(m, lambda: T("«Жизнь»: режим", "Life: mode"), "life_mode",
+                    [("random", lambda: T("случайная", "random")), ("edges", lambda: T("края + центр", "edges + centre")),
+                     ("draw", lambda: T("рисование кликом", "draw with clicks"))])
+        ap = self._sub(m, lambda: T("Автопауза", "Auto-pause"))
+        self._toggle(ap, lambda: T("Энергосбережение", "Power saver"), "autopause.powersaver")
+        thr = lambda: cfg()["autopause"]["battery_threshold"]
+        self._toggle(ap, lambda: T(f"Батарея < {thr()}%", f"Battery < {thr()}%"), "autopause.battery")
+        self._toggle(ap, lambda: T("Экран заблокирован / сеанс неактивен", "Screen locked / session idle"),
+                     "autopause.locked")
+        m.addSeparator()
+        mb = lambda: cfg()["metrics_max_mb"]
+        self._toggle(m, lambda: T(f"Записывать замер нагрузки (архив до {mb():g} МБ)",
+                                  f"Record load metrics (archive up to {mb():g} MB)"), "metrics")
+        self._radio(m, lambda: "Язык / Language", "language", [("ru", lambda: "Русский"), ("en", lambda: "English")])
+        m.addSeparator()
+        self._act(m, lambda: T("Справка: что есть что", "Help: what is what"), self.show_help)
+        self._act(m, lambda: T("Выход", "Quit"), self.app.quit)
+
+    def update(self):
+        st, cfg = self.svc.status(), self.svc.cfg
+        fg = self.app.palette().windowText().color()
+        if cfg["paused"]:
+            kind, tip = "paused", T("DotGrid Live: пауза", "DotGrid Live: paused")
+        elif st["auto_paused"]:
+            kind = "auto"
+            tip = T("DotGrid Live: автопауза (", "DotGrid Live: auto-paused (") + \
+                ", ".join(rule_name(r) for r in st["auto_reasons"]) + ")"
+        else:
+            kind, tip = "running", T("DotGrid Live: идёт", "DotGrid Live: running")
+        if (kind, fg.name()) != getattr(self, "icon_key", None):     # colour follows the theme
+            self.icon_key = (kind, fg.name())
+            self.tray.setIcon(make_icon(kind, fg))
+        self.tray.setToolTip(tip)
+        # in place: only what actually changed is sent to the panel
+        for a, text, checked, visible in self.items:
+            s = text()
+            if a.text() != s:
+                a.setText(s)
+            if checked is not None and a.isChecked() != bool(checked()):
+                a.setChecked(bool(checked()))
+            if visible is not None and a.isVisible() != bool(visible()):
+                a.setVisible(bool(visible()))
+
+
+class Shortcut(QObject):
+    """Global shortcut through KGlobalAccel; the user can rebind it in System Settings."""
+    COMPONENT = "dotgrid-live"
+    ACTION = ["dotgrid-live", "toggle-pause", "DotGrid Live", "Пауза / продолжить анимацию обоев"]
+    # Qt key codes: Meta 0x10000000, Shift 0x02000000, Ctrl 0x04000000, Alt 0x08000000
+    MODS = {"meta": 0x10000000, "shift": 0x02000000, "ctrl": 0x04000000, "alt": 0x08000000}
+
+    def __init__(self, svc, keys):
+        super().__init__()
+        self.svc = svc
+        self.ok = False
+        code = self._code(keys)
+        if code is None:
+            return
+        try:
+            ids = "[" + ",".join(f"'{s}'" for s in self.ACTION) + "]"
+            base = ["gdbus", "call", "--session", "-d", "org.kde.kglobalaccel", "-o", "/kglobalaccel", "-m"]
+            subprocess.run(base + ["org.kde.KGlobalAccel.doRegister", ids], capture_output=True, timeout=5, check=True)
+            # default first, then the present value (keeps a binding the user changed)
+            subprocess.run(base + ["org.kde.KGlobalAccel.setShortcut", ids, f"[{code}]", "1"],
+                           capture_output=True, timeout=5, check=True)
+            subprocess.run(base + ["org.kde.KGlobalAccel.setShortcut", ids, f"[{code}]", "2"],
+                           capture_output=True, timeout=5, check=True)
+        except (OSError, subprocess.SubprocessError):
+            return
+        path = "/component/" + self.COMPONENT.replace("-", "_")
+        self.ok = QDBusConnection.sessionBus().connect(
+            "org.kde.kglobalaccel", path, "org.kde.kglobalaccel.Component", "globalShortcutPressed",
+            self, SLOT("onPressed(QDBusMessage)"))
+
+    def _code(self, keys):
+        parts = [p.strip().lower() for p in keys.split("+")]
+        code = 0
+        for p in parts[:-1]:
+            if p not in self.MODS:
+                return None
+            code |= self.MODS[p]
+        last = parts[-1].upper()
+        if len(last) != 1 or not last.isalnum():
+            return None
+        return code | ord(last)
+
+    @Slot(QDBusMessage)
+    def onPressed(self, msg):
+        args = msg.arguments()
+        if len(args) >= 2 and args[1] == "toggle-pause":
+            self.svc.Toggle()
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("dotgrid-livectl")
+    app.setQuitOnLastWindowClosed(False)
+
+    bus = QDBusConnection.sessionBus()
+    if not bus.registerService("org.dotgrid.Live"):
+        print("dotgrid-livectl: already running", file=sys.stderr)
+        return 1
+    svc = LiveService()
+    bus.registerObject("/org/dotgrid/Live", svc,
+                       QDBusConnection.ExportAllSlots | QDBusConnection.ExportAllSignals)
+    if "--no-tray" not in sys.argv:
+        tray = Tray(svc, app)  # noqa: F841 (kept alive)
+    shortcut = Shortcut(svc, svc.cfg["shortcut"])
+    if not shortcut.ok:
+        print("dotgrid-livectl: global shortcut not registered", file=sys.stderr)
+    svc._emit()
+    # SIGTERM (systemd) / SIGINT (terminal): Python handlers only run when the
+    # interpreter gets control, so the signal wakes the Qt loop through a
+    # socket instead of a polling timer; the process sleeps while idle.
+    rsock, wsock = socket.socketpair()
+    rsock.setblocking(False)
+    wsock.setblocking(False)
+    signal.set_wakeup_fd(wsock.fileno())
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: app.quit())
+    notifier = QSocketNotifier(rsock.fileno(), QSocketNotifier.Read)
+    notifier.activated.connect(lambda *_: rsock.recv(64))
+    rc = app.exec()
+    svc.shutdown()
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())
