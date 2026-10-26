@@ -162,7 +162,10 @@ def frame_svg(t):
         for key, (x, yy, ww, hh) in pieces.items():
             fill = title if key in ("topleft", "top", "topright") else border
             if key == "center":
-                fill, op = title, 0      # the window content shows through
+                # a framed window covers the centre with its content, so it stays
+                # empty; a maximized title bar is drawn from the centre alone
+                # (no borders), so there it is the title bar
+                fill, op = title, (0 if frame else 1)
             else:
                 op = 1
             inner = f'<rect x="{x}" y="{yy}" width="{ww}" height="{hh}" fill="{fill}" fill-opacity="{op}"/>'
@@ -182,7 +185,7 @@ def frame_svg(t):
     slice_set("decoration-maximized", t["title"], t["border"], False)
     slice_set("decoration-maximized-inactive", t["title_inactive"], t["border_inactive"], False)
     w = 2 * B + 10
-    return f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{y_rows}" viewBox="0 0 {w} {y_rows}">{"".join(parts)}</svg>\n'
+    return f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{y_rows}" viewBox="0 0 {w} {y_rows}" shape-rendering="crispEdges">{"".join(parts)}</svg>\n'
 
 
 def rc(t):
